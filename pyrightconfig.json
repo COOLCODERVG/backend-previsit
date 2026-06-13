@@ -1,0 +1,12 @@
+{
+  "include": ["."],
+  "exclude": ["**/__pycache__", ".venv"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "overrides": [
+    {
+      "include": ["**/migrations"],
+      "reportMissingImports": "none"
+    }
+  ]
+}

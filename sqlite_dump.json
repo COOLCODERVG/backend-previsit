@@ -1,0 +1,474 @@
+[
+{
+  "model": "api.user",
+  "pk": 1,
+  "fields": {
+    "password": "pbkdf2_sha256$1000000$l1qepKFlvLNgubm6e7FNTI$FCNoIUbiRIUeEHkP1pV/viRqdelj1amz7L4OJ1RV8GQ=",
+    "last_login": null,
+    "email": "hello@gmail.com",
+    "name": "Admin",
+    "role": "admin",
+    "created_at": "2026-04-14T02:59:15.847Z"
+  }
+},
+{
+  "model": "api.user",
+  "pk": 2,
+  "fields": {
+    "password": "pbkdf2_sha256$1000000$5rq39EF68lDXy08uzcn4AN$E6owN432PF0Z7R49Ohat8DRLHclOy31T7W/BhZtCDCc=",
+    "last_login": null,
+    "email": "test_20260414030417@example.com",
+    "name": "Test User",
+    "role": "user",
+    "created_at": "2026-04-14T03:04:18.200Z"
+  }
+},
+{
+  "model": "api.user",
+  "pk": 3,
+  "fields": {
+    "password": "pbkdf2_sha256$1000000$le2sdsXKTwnBUTQhkVfIkz$QL4t0XIxzEQiZc9iyPAVy6e5VCSJMcCsHuBdw13/d+E=",
+    "last_login": null,
+    "email": "varshith.gudeus@gmail.com",
+    "name": "Varshith",
+    "role": "user",
+    "created_at": "2026-04-14T04:09:27.202Z"
+  }
+},
+{
+  "model": "api.user",
+  "pk": 4,
+  "fields": {
+    "password": "pbkdf2_sha256$1000000$Wl3dKveVVukOo1WkjG9z7Z$lQrHA2lJtCmPJKvOgAnowFAjR2J4Z5cBc4LzpVTV23w=",
+    "last_login": null,
+    "email": "uf@gmail.com",
+    "name": "jf",
+    "role": "user",
+    "created_at": "2026-04-14T04:30:01.778Z"
+  }
+},
+{
+  "model": "api.personalizationprofile",
+  "pk": 1,
+  "fields": {
+    "user": 3,
+    "main_reason": "Dmd",
+    "condition_stage": "not_sure",
+    "biggest_concern": "Dikf",
+    "prepared_items": [
+      "medications_list"
+    ],
+    "appointment_outcome": "clear_diagnosis",
+    "is_completed": true,
+    "created_at": "2026-04-16T03:32:27.377Z",
+    "updated_at": "2026-04-16T03:32:48.518Z"
+  }
+},
+{
+  "model": "api.personalizationprofile",
+  "pk": 2,
+  "fields": {
+    "user": 1,
+    "main_reason": "grequent headaches and fatigue",
+    "condition_stage": "ongoing",
+    "biggest_concern": "Nothing",
+    "prepared_items": [
+      "nothing_yet"
+    ],
+    "appointment_outcome": "heard_understood",
+    "is_completed": true,
+    "created_at": "2026-04-28T04:50:51.829Z",
+    "updated_at": "2026-04-28T04:52:28.900Z"
+  }
+},
+{
+  "model": "api.appointment",
+  "pk": 1,
+  "fields": {
+    "user": 1,
+    "doctor_name": "Dr. Smith",
+    "specialty": "Dermatologist",
+    "location": null,
+    "appointment_date": "2026-05-01",
+    "appointment_time": "10:00",
+    "notes": null,
+    "is_completed": false,
+    "created_at": "2026-04-14T02:59:36.202Z",
+    "updated_at": "2026-04-14T02:59:36.202Z"
+  }
+},
+{
+  "model": "api.appointment",
+  "pk": 2,
+  "fields": {
+    "user": 1,
+    "doctor_name": "TEST Dr. Smith",
+    "specialty": "Cardiology",
+    "location": "Main Hospital",
+    "appointment_date": "2026-05-15",
+    "appointment_time": "10:30",
+    "notes": "Annual checkup",
+    "is_completed": false,
+    "created_at": "2026-04-14T03:04:19.045Z",
+    "updated_at": "2026-04-14T03:04:19.045Z"
+  }
+},
+{
+  "model": "api.appointment",
+  "pk": 3,
+  "fields": {
+    "user": 1,
+    "doctor_name": "TEST Dr. Jones Updated",
+    "specialty": null,
+    "location": null,
+    "appointment_date": "2026-06-01",
+    "appointment_time": "14:00",
+    "notes": null,
+    "is_completed": true,
+    "created_at": "2026-04-14T03:04:19.266Z",
+    "updated_at": "2026-04-14T03:04:19.351Z"
+  }
+},
+{
+  "model": "api.appointment",
+  "pk": 5,
+  "fields": {
+    "user": 1,
+    "doctor_name": "TEST Dr. Symptom",
+    "specialty": null,
+    "location": null,
+    "appointment_date": "2026-05-20",
+    "appointment_time": "11:00",
+    "notes": null,
+    "is_completed": false,
+    "created_at": "2026-04-14T03:04:19.789Z",
+    "updated_at": "2026-04-14T03:04:19.789Z"
+  }
+},
+{
+  "model": "api.appointment",
+  "pk": 6,
+  "fields": {
+    "user": 1,
+    "doctor_name": "TEST Dr. Update",
+    "specialty": null,
+    "location": null,
+    "appointment_date": "2026-05-21",
+    "appointment_time": "12:00",
+    "notes": null,
+    "is_completed": false,
+    "created_at": "2026-04-14T03:04:20.025Z",
+    "updated_at": "2026-04-14T03:04:20.025Z"
+  }
+},
+{
+  "model": "api.appointment",
+  "pk": 7,
+  "fields": {
+    "user": 1,
+    "doctor_name": "TEST Dr. Question",
+    "specialty": null,
+    "location": null,
+    "appointment_date": "2026-05-22",
+    "appointment_time": "13:00",
+    "notes": null,
+    "is_completed": false,
+    "created_at": "2026-04-14T03:04:20.403Z",
+    "updated_at": "2026-04-14T03:04:20.403Z"
+  }
+},
+{
+  "model": "api.appointment",
+  "pk": 8,
+  "fields": {
+    "user": 1,
+    "doctor_name": "TEST Dr. Note",
+    "specialty": null,
+    "location": null,
+    "appointment_date": "2026-05-23",
+    "appointment_time": "14:00",
+    "notes": null,
+    "is_completed": false,
+    "created_at": "2026-04-14T03:04:20.633Z",
+    "updated_at": "2026-04-14T03:04:20.633Z"
+  }
+},
+{
+  "model": "api.appointment",
+  "pk": 9,
+  "fields": {
+    "user": 1,
+    "doctor_name": "TEST Dr. Recording",
+    "specialty": null,
+    "location": null,
+    "appointment_date": "2026-05-24",
+    "appointment_time": "15:00",
+    "notes": null,
+    "is_completed": false,
+    "created_at": "2026-04-14T03:04:20.844Z",
+    "updated_at": "2026-04-14T03:04:20.844Z"
+  }
+},
+{
+  "model": "api.appointment",
+  "pk": 10,
+  "fields": {
+    "user": 1,
+    "doctor_name": "TEST Dr. Summary",
+    "specialty": null,
+    "location": null,
+    "appointment_date": "2026-05-25",
+    "appointment_time": "16:00",
+    "notes": null,
+    "is_completed": false,
+    "created_at": "2026-04-14T03:04:21.058Z",
+    "updated_at": "2026-04-14T03:04:21.058Z"
+  }
+},
+{
+  "model": "api.appointment",
+  "pk": 13,
+  "fields": {
+    "user": 3,
+    "doctor_name": "Dr. Reed",
+    "specialty": "Dermatology",
+    "location": "City Medical Center",
+    "appointment_date": "2026-04-19",
+    "appointment_time": "09:00",
+    "notes": null,
+    "is_completed": false,
+    "created_at": "2026-04-16T03:57:54.674Z",
+    "updated_at": "2026-04-16T03:57:54.674Z"
+  }
+},
+{
+  "model": "api.symptom",
+  "pk": 1,
+  "fields": {
+    "user": 1,
+    "appointment": 1,
+    "name": "Rash",
+    "severity": 6,
+    "timing": "Morning",
+    "duration": null,
+    "is_new": true,
+    "is_worsening": false,
+    "notes": null,
+    "created_at": "2026-04-14T02:59:36.240Z",
+    "updated_at": "2026-04-14T02:59:36.240Z"
+  }
+},
+{
+  "model": "api.symptom",
+  "pk": 2,
+  "fields": {
+    "user": 1,
+    "appointment": 5,
+    "name": "TEST Headache",
+    "severity": 7,
+    "timing": "Morning",
+    "duration": "2 hours",
+    "is_new": true,
+    "is_worsening": false,
+    "notes": null,
+    "created_at": "2026-04-14T03:04:19.875Z",
+    "updated_at": "2026-04-14T03:04:19.875Z"
+  }
+},
+{
+  "model": "api.symptom",
+  "pk": 3,
+  "fields": {
+    "user": 1,
+    "appointment": 6,
+    "name": "TEST Cough",
+    "severity": 8,
+    "timing": null,
+    "duration": null,
+    "is_new": true,
+    "is_worsening": true,
+    "notes": null,
+    "created_at": "2026-04-14T03:04:20.094Z",
+    "updated_at": "2026-04-14T03:04:20.169Z"
+  }
+},
+{
+  "model": "api.symptom",
+  "pk": 4,
+  "fields": {
+    "user": 1,
+    "appointment": 10,
+    "name": "TEST Summary Symptom",
+    "severity": 6,
+    "timing": null,
+    "duration": null,
+    "is_new": true,
+    "is_worsening": false,
+    "notes": null,
+    "created_at": "2026-04-14T03:04:21.136Z",
+    "updated_at": "2026-04-14T03:04:21.136Z"
+  }
+},
+{
+  "model": "api.symptom",
+  "pk": 5,
+  "fields": {
+    "user": 3,
+    "appointment": 13,
+    "name": "Fatigue",
+    "severity": 8,
+    "timing": "Morning",
+    "duration": "2-3 days",
+    "is_new": true,
+    "is_worsening": true,
+    "notes": null,
+    "created_at": "2026-04-16T03:58:25.539Z",
+    "updated_at": "2026-04-16T03:58:25.540Z"
+  }
+},
+{
+  "model": "api.feeling",
+  "pk": 1,
+  "fields": {
+    "user": 1,
+    "health_score": 7,
+    "energy_level": 6,
+    "mood": "good",
+    "notes": null,
+    "date": "2026-04-14",
+    "created_at": "2026-04-14T02:59:36.259Z",
+    "updated_at": "2026-04-14T02:59:36.259Z"
+  }
+},
+{
+  "model": "api.feeling",
+  "pk": 2,
+  "fields": {
+    "user": 1,
+    "health_score": 8,
+    "energy_level": 7,
+    "mood": "Good",
+    "notes": "TEST Feeling great today",
+    "date": "2026-04-14",
+    "created_at": "2026-04-14T03:04:20.251Z",
+    "updated_at": "2026-04-14T03:04:20.251Z"
+  }
+},
+{
+  "model": "api.feeling",
+  "pk": 3,
+  "fields": {
+    "user": 3,
+    "health_score": 5,
+    "energy_level": 10,
+    "mood": "okay",
+    "notes": null,
+    "date": "2026-04-13",
+    "created_at": "2026-04-14T04:53:45.546Z",
+    "updated_at": "2026-04-14T04:53:45.546Z"
+  }
+},
+{
+  "model": "api.question",
+  "pk": 1,
+  "fields": {
+    "user": 1,
+    "appointment": 1,
+    "text": "Should I use sunscreen?",
+    "priority": 1,
+    "is_answered": false,
+    "answer_notes": null,
+    "created_at": "2026-04-14T02:59:36.278Z",
+    "updated_at": "2026-04-14T02:59:36.278Z"
+  }
+},
+{
+  "model": "api.question",
+  "pk": 2,
+  "fields": {
+    "user": 1,
+    "appointment": 7,
+    "text": "TEST What are the side effects?",
+    "priority": 1,
+    "is_answered": false,
+    "answer_notes": null,
+    "created_at": "2026-04-14T03:04:20.475Z",
+    "updated_at": "2026-04-14T03:04:20.475Z"
+  }
+},
+{
+  "model": "api.question",
+  "pk": 3,
+  "fields": {
+    "user": 1,
+    "appointment": 10,
+    "text": "TEST Summary Question",
+    "priority": 1,
+    "is_answered": false,
+    "answer_notes": null,
+    "created_at": "2026-04-14T03:04:21.213Z",
+    "updated_at": "2026-04-14T03:04:21.213Z"
+  }
+},
+{
+  "model": "api.question",
+  "pk": 5,
+  "fields": {
+    "user": 3,
+    "appointment": 13,
+    "text": "Does my current medication help or worse the symptoms?",
+    "priority": 1,
+    "is_answered": false,
+    "answer_notes": null,
+    "created_at": "2026-04-16T03:58:47.989Z",
+    "updated_at": "2026-04-16T03:58:47.989Z"
+  }
+},
+{
+  "model": "api.note",
+  "pk": 1,
+  "fields": {
+    "user": 1,
+    "appointment": 1,
+    "title": "Bring photos",
+    "content": "Show doctor photos of the rash from last week",
+    "category": "reminder",
+    "created_at": "2026-04-14T02:59:36.297Z",
+    "updated_at": "2026-04-14T02:59:36.297Z"
+  }
+},
+{
+  "model": "api.note",
+  "pk": 2,
+  "fields": {
+    "user": 1,
+    "appointment": 8,
+    "title": "TEST Important Note",
+    "content": "Remember to bring medical records",
+    "category": "preparation",
+    "created_at": "2026-04-14T03:04:20.705Z",
+    "updated_at": "2026-04-14T03:04:20.705Z"
+  }
+},
+{
+  "model": "api.recording",
+  "pk": 1,
+  "fields": {
+    "user": 1,
+    "appointment": 9,
+    "title": "TEST Voice Note",
+    "duration_seconds": 120,
+    "audio_storage": "local",
+    "audio_object_key": "",
+    "audio_content_type": "",
+    "audio_size_bytes": 0,
+    "audio_sha256": "",
+    "status": "created",
+    "transcript_text": "",
+    "transcript_json": {},
+    "extracted_entities": {},
+    "created_at": "2026-04-14T03:04:20.916Z",
+    "updated_at": "2026-04-30T08:50:08.768Z"
+  }
+}
+]

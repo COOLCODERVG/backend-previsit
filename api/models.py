@@ -56,6 +56,9 @@ class PersonalizationProfile(models.Model):
         default='',
     )
     family_history = models.TextField(blank=True, default='')
+    # Question/answer rows from ML onboarding (representation-editing preferences).
+    # Shape: [{"question": str, "answer": str}, ...]
+    ml_preferences = models.JSONField(default=list, blank=True)
     is_completed = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -145,10 +148,40 @@ class Note(models.Model):
 
 
 class Recording(models.Model):
+    STATUS_CHOICES = [
+        ('created', 'created'),
+        ('uploaded', 'uploaded'),
+        ('transcribing', 'transcribing'),
+        ('transcribed', 'transcribed'),
+        ('extracting', 'extracting'),
+        ('extracted', 'extracted'),
+        ('failed', 'failed'),
+    ]
+    AUDIO_STORAGE_CHOICES = [
+        ('local', 'local'),
+        ('s3', 's3'),
+        ('inline', 'inline'),
+    ]
+
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='recordings')
     appointment = models.ForeignKey(Appointment, on_delete=models.CASCADE, related_name='recordings')
     title = models.CharField(max_length=255)
     duration_seconds = models.IntegerField(default=0)
+    audio_storage = models.CharField(max_length=20, choices=AUDIO_STORAGE_CHOICES, default='local')
+    audio_object_key = models.CharField(max_length=1024, blank=True, default='')
+    audio_content_type = models.CharField(max_length=120, blank=True, default='')
+    audio_size_bytes = models.BigIntegerField(default=0)
+    audio_sha256 = models.CharField(max_length=64, blank=True, default='')
+    status = models.CharField(
+        max_length=30,
+        choices=STATUS_CHOICES,
+        default='created',
+        help_text='created|uploaded|transcribing|transcribed|extracting|extracted|failed',
+    )
+    transcript_text = models.TextField(blank=True, default='')
+    transcript_json = models.JSONField(blank=True, default=dict)
+    extracted_entities = models.JSONField(blank=True, default=dict)
+    # Backwards-compatible local/dev fallback for inline upload payloads.
     audio_base64 = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

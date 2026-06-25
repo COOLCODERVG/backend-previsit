@@ -3,6 +3,7 @@ from rest_framework.response import Response
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
+import logging
 import os
 import re
 import json
@@ -12,6 +13,8 @@ import requests
 
 from .llm_client import call_llama_pdf_guidance, call_llama_visit_one_pager
 from .llm_retrieval import build_pdf_guidance_retrieval_query, retrieve_steering_for_inference
+
+logger = logging.getLogger(__name__)
 
 
 def custom_exception_handler(exc, context):
@@ -259,6 +262,14 @@ def _build_deidentified_llm_payload(summary_payload, export_preferences=None, us
             'prepared_items': [str(v) for v in (personalization.get('prepared_items') or [])],
             'appointment_outcome': personalization.get('appointment_outcome') or '',
             'family_history': family_history,
+            'ml_preferences': [
+                {
+                    'question': _sanitize_for_llm((item or {}).get('question'), 220),
+                    'answer': _sanitize_for_llm((item or {}).get('answer'), 280),
+                }
+                for item in (personalization.get('ml_preferences') or [])
+                if isinstance(item, dict)
+            ][:20],
         },
         'signals': {
             'symptom_count': len(symptoms),
@@ -382,6 +393,7 @@ def generate_visit_one_pager(summary_payload, *, view_mode="standard", user_id=N
                 top_k=5,
             )
     except Exception:
+        logger.exception("one_pager steering retrieval failed for user=%s", user_id)
         steering_vectors = []
 
     raw = call_llama_visit_one_pager(
@@ -411,6 +423,7 @@ def generate_llm_pdf_guidance(summary_payload, export_preferences=None, user_id=
                 top_k=5,
             )
     except Exception:
+        logger.exception("pdf_guidance steering retrieval failed for user=%s", user_id)
         steering_vectors = []
 
     guidance = call_llama_pdf_guidance(

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+
+from django.conf import settings
+from django.db import connections
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -13,15 +17,22 @@ from .serializers import (
     SteeringVectorUpsertSerializer,
 )
 
+logger = logging.getLogger(__name__)
+
+
+def _vectors_alias() -> str:
+    return "vectors" if "vectors" in settings.DATABASES else "default"
+
 
 def _results_for_contexts(*, user_id: int, contexts: list, distances: list | None = None) -> list:
     results = []
+    alias = _vectors_alias()
     for i, ctx in enumerate(contexts):
         dist = None
         if distances is not None and i < len(distances):
             dist = distances[i]
         steer = list(
-            SteeringVector.objects.using("vectors")
+            SteeringVector.objects.using(alias)
             .filter(user_id=user_id, context_id=ctx.id)
             .order_by("layer", "-created_at")[:3]
         )
@@ -64,15 +75,33 @@ def search_preference_contexts(request):
         qv = encode_query_text(qt)
 
     note = None
+    alias = _vectors_alias()
     if qv is None and qt:
         note = "embedding_unavailable_fell_back_to_recent"
+
+    if connections[alias].vendor != "postgresql":
+        note = note or f"non_postgres_backend:{connections[alias].vendor}; returned most recent contexts"
+        qs = (
+            PreferenceContext.objects.using(alias)
+            .filter(user_id=user_id)
+            .order_by("-created_at")[:top_k]
+        )
+        contexts = list(qs)
+        logger.info(
+            "vector_search mode=recent user_id=%s contexts=%s alias=%s reason=%s",
+            user_id,
+            len(contexts),
+            alias,
+            note,
+        )
+        return Response({"results": _results_for_contexts(user_id=user_id, contexts=contexts, distances=None), "note": note})
 
     try:
         from pgvector.django import CosineDistance  # type: ignore
 
         if qv is not None:
             qs = (
-                PreferenceContext.objects.using("vectors")
+                PreferenceContext.objects.using(alias)
                 .filter(user_id=user_id)
                 .exclude(semantic_vec=None)
                 .annotate(distance=CosineDistance("semantic_vec", qv))
@@ -80,19 +109,32 @@ def search_preference_contexts(request):
             )
             contexts = list(qs)
             dists = [float(getattr(c, "distance", 0.0)) for c in contexts]
+            logger.info(
+                "vector_search mode=ann user_id=%s contexts=%s alias=%s",
+                user_id,
+                len(contexts),
+                alias,
+            )
             payload = {"results": _results_for_contexts(user_id=user_id, contexts=contexts, distances=dists)}
             if note:
                 payload["note"] = note
             return Response(payload)
     except Exception:
-        pass
+        logger.warning("vector_search ANN unavailable; falling back to recent", exc_info=True)
 
     qs = (
-        PreferenceContext.objects.using("vectors")
+        PreferenceContext.objects.using(alias)
         .filter(user_id=user_id)
         .order_by("-created_at")[:top_k]
     )
     contexts = list(qs)
+    logger.info(
+        "vector_search mode=recent user_id=%s contexts=%s alias=%s reason=%s",
+        user_id,
+        len(contexts),
+        alias,
+        note or "pgvector_not_active_or_no_query_vector",
+    )
     payload = {
         "results": _results_for_contexts(user_id=user_id, contexts=contexts, distances=None),
         "note": note or "pgvector_not_active_or_no_query_vector; returned most recent contexts",
@@ -114,8 +156,9 @@ def upsert_preference_context(request):
     meta = d.get("representation_meta")
     if meta is None:
         meta = {}
+    alias = _vectors_alias()
 
-    ctx = PreferenceContext.objects.using("vectors").create(
+    ctx = PreferenceContext.objects.using(alias).create(
         user_id=int(request.user.id),
         source=(d.get("source") or "signup").strip() or "signup",
         content=d["content"],
@@ -139,8 +182,9 @@ def add_steering_vector(request):
     norm = float(d.get("norm") or 0.0)
     if not norm:
         norm = sum((float(x) * float(x) for x in vec)) ** 0.5
+    alias = _vectors_alias()
 
-    item = SteeringVector.objects.using("vectors").create(
+    item = SteeringVector.objects.using(alias).create(
         user_id=int(request.user.id),
         context_id=d["context_id"],
         layer=int(d["layer"]),

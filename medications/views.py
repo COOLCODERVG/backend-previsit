@@ -12,6 +12,7 @@ from .serializers import (
     MedicationReminderSerializer,
     MedicationReminderCreateSerializer,
 )
+from vectors.personalization_sync import sync_user_preference_vectors
 
 
 @api_view(["GET", "POST"])
@@ -42,6 +43,13 @@ def medications_view(request):
         confidence=0.0,
     )
     MedicationEvent.objects.create(medication=med, event_type="created", payload={"source": "manual"})
+    try:
+        sync_user_preference_vectors(
+            user_id=int(request.user.id),
+            extra_contexts=[f"Manual medication added: {med.name}"],
+        )
+    except Exception:
+        pass
     return Response(MedicationSerializer(med).data, status=201)
 
 
@@ -66,9 +74,23 @@ def medication_detail_view(request, pk: int):
             else:
                 MedicationEvent.objects.create(medication=med, event_type="modified", payload=changed)
             med.save()
+            try:
+                sync_user_preference_vectors(
+                    user_id=int(request.user.id),
+                    extra_contexts=[f"Medication updated: {med.name}"],
+                )
+            except Exception:
+                pass
         return Response(MedicationSerializer(med).data)
 
     med.delete()
+    try:
+        sync_user_preference_vectors(
+            user_id=int(request.user.id),
+            extra_contexts=[f"Medication removed: {med.name}"],
+        )
+    except Exception:
+        pass
     return Response({"message": "Medication deleted successfully"})
 
 

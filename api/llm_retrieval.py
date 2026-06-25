@@ -15,6 +15,8 @@ import os
 from typing import Any, Dict, List, Optional
 
 import requests
+from django.conf import settings
+from django.db import connections
 
 from vectors.models import PreferenceContext, SteeringVector
 
@@ -27,6 +29,10 @@ def _embedding_service_url() -> str:
 
 def _llm_base_url() -> str:
     return (os.environ.get("LLM_INFERENCE_URL") or "").strip().rstrip("/")
+
+
+def _vectors_alias() -> str:
+    return "vectors" if "vectors" in settings.DATABASES else "default"
 
 
 def encode_query_text(text: str, *, timeout_seconds: float = 30.0) -> Optional[List[float]]:
@@ -81,9 +87,10 @@ def encode_query_text(text: str, *, timeout_seconds: float = 30.0) -> Optional[L
 
 def _steering_dicts_for_contexts(user_id: int, contexts: List[PreferenceContext], per_context: int = 3) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    alias = _vectors_alias()
     for ctx in contexts:
         steer = list(
-            SteeringVector.objects.using("vectors")
+            SteeringVector.objects.using(alias)
             .filter(user_id=user_id, context_id=ctx.id)
             .order_by("-norm", "layer", "-created_at")[:per_context]
         )
@@ -100,21 +107,54 @@ def _steering_dicts_for_contexts(user_id: int, contexts: List[PreferenceContext]
     return out
 
 
-def steering_vectors_recent(*, user_id: int, top_k: int = 5, per_context: int = 3) -> List[Dict[str, Any]]:
+def steering_vectors_recent(
+    *,
+    user_id: int,
+    top_k: int = 5,
+    per_context: int = 3,
+    reason: str = "fallback_recent",
+) -> List[Dict[str, Any]]:
+    alias = _vectors_alias()
     contexts = list(
-        PreferenceContext.objects.using("vectors")
+        PreferenceContext.objects.using(alias)
         .filter(user_id=user_id)
         .order_by("-created_at")[:top_k]
     )
-    return _steering_dicts_for_contexts(user_id, contexts, per_context=per_context)
+    out = _steering_dicts_for_contexts(user_id, contexts, per_context=per_context)
+    logger.info(
+        "steering_retrieval mode=recent reason=%s user_id=%s contexts=%s vectors=%s alias=%s",
+        reason,
+        user_id,
+        len(contexts),
+        len(out),
+        alias,
+    )
+    return out
 
 
 def steering_vectors_ann(*, user_id: int, query_vector: List[float], top_k: int = 5, per_context: int = 3) -> List[Dict[str, Any]]:
+    alias = _vectors_alias()
+    if connections[alias].vendor != "postgresql":
+        return steering_vectors_recent(
+            user_id=user_id,
+            top_k=top_k,
+            per_context=per_context,
+            reason=f"non_postgres_backend:{connections[alias].vendor}",
+        )
     try:
         from pgvector.django import CosineDistance  # type: ignore
 
+        semantic_field = PreferenceContext._meta.get_field("semantic_vec")
+        if semantic_field.__class__.__name__ != "VectorField":
+            return steering_vectors_recent(
+                user_id=user_id,
+                top_k=top_k,
+                per_context=per_context,
+                reason="semantic_vec_not_vector_field",
+            )
+
         qs = (
-            PreferenceContext.objects.using("vectors")
+            PreferenceContext.objects.using(alias)
             .filter(user_id=user_id)
             .exclude(semantic_vec=None)
             .annotate(distance=CosineDistance("semantic_vec", query_vector))
@@ -122,11 +162,31 @@ def steering_vectors_ann(*, user_id: int, query_vector: List[float], top_k: int 
         )
         contexts = list(qs)
         if contexts:
-            return _steering_dicts_for_contexts(user_id, contexts, per_context=per_context)
+            out = _steering_dicts_for_contexts(user_id, contexts, per_context=per_context)
+            logger.info(
+                "steering_retrieval mode=ann user_id=%s contexts=%s vectors=%s alias=%s dim=%s",
+                user_id,
+                len(contexts),
+                len(out),
+                alias,
+                len(query_vector),
+            )
+            return out
+        return steering_vectors_recent(
+            user_id=user_id,
+            top_k=top_k,
+            per_context=per_context,
+            reason="ann_empty_result",
+        )
     except Exception:
-        logger.debug("ANN steering retrieval unavailable", exc_info=True)
+        logger.warning("ANN steering retrieval unavailable; falling back to recent", exc_info=True)
 
-    return steering_vectors_recent(user_id=user_id, top_k=top_k, per_context=per_context)
+    return steering_vectors_recent(
+        user_id=user_id,
+        top_k=top_k,
+        per_context=per_context,
+        reason="ann_exception",
+    )
 
 
 def retrieve_steering_for_inference(
@@ -141,15 +201,18 @@ def retrieve_steering_for_inference(
     Otherwise use recent preference contexts (same ordering as pre-retrieval stub).
     """
     if query_vector:
+        logger.info("steering_retrieval request=user_provided_vector user_id=%s top_k=%s", user_id, top_k)
         return steering_vectors_ann(user_id=user_id, query_vector=query_vector, top_k=top_k)
 
     q = (query_text or "").strip()
     if q:
         vec = encode_query_text(q)
         if vec:
+            logger.info("steering_retrieval request=encoded_query user_id=%s top_k=%s", user_id, top_k)
             return steering_vectors_ann(user_id=user_id, query_vector=vec, top_k=top_k)
+        logger.warning("steering_retrieval embedding_unavailable user_id=%s; falling back to recent", user_id)
 
-    return steering_vectors_recent(user_id=user_id, top_k=top_k)
+    return steering_vectors_recent(user_id=user_id, top_k=top_k, reason="no_query_vector")
 
 
 def build_pdf_guidance_retrieval_query(deidentified: Dict[str, Any]) -> str:
@@ -168,4 +231,15 @@ def build_pdf_guidance_retrieval_query(deidentified: Dict[str, Any]) -> str:
         for item in ts[:4]:
             if isinstance(item, dict) and item.get("name"):
                 parts.append(str(item.get("name")))
+    ml = pers.get("ml_preferences") or []
+    if isinstance(ml, list):
+        for item in ml[:6]:
+            if not isinstance(item, dict):
+                continue
+            q = item.get("question")
+            a = item.get("answer")
+            if q:
+                parts.append(str(q))
+            if a:
+                parts.append(str(a))
     return "\n".join(parts).strip()

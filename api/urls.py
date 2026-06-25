@@ -15,6 +15,8 @@ urlpatterns = [
     path('auth/refresh', views.refresh_view),
     path('auth/oidc-config', views.oidc_config_view),
     path('personalization', views.personalization_view),
+    path('personalization/ml-status', views.personalization_ml_status_view),
+    path('personalization/ml-refresh', views.personalization_ml_refresh_view),
 
     # Appointments
     path('appointments', views.appointments_view),

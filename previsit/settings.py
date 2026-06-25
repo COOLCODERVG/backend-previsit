@@ -85,19 +85,22 @@ DOCS_DATABASE_URL = os.environ.get("DOCS_DATABASE_URL", "").strip()
 #        }
 #    }
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": "postgres",
-        "USER": "postgres",
-        "PASSWORD": os.environ["DB_PASSWORD"],
-        "HOST": "database-2.cluster-crk4uo2kehfn.us-west-2.rds.amazonaws.com",
-        "PORT": "5432",
-        "OPTIONS": {
-            "sslmode": "require",
-        },
+if CORE_DATABASE_URL:
+    DATABASES = {"default": _database_from_url(CORE_DATABASE_URL)}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": os.environ.get("DB_NAME", "postgres"),
+            "USER": os.environ.get("DB_USER", "postgres"),
+            "PASSWORD": os.environ.get("DB_PASSWORD", ""),
+            "HOST": os.environ.get("DB_HOST", "syniviadb.crk4uo2kehfn.us-west-2.rds.amazonaws.com"),
+            "PORT": os.environ.get("DB_PORT", "5432"),
+            "OPTIONS": {
+                "sslmode": os.environ.get("DB_SSLMODE", "require"),
+            },
+        }
     }
-}
 
 # Optional: separate RDS instances (or separate DBs) for vectors and documents.
 if VECTORS_DATABASE_URL:

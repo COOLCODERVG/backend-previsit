@@ -47,6 +47,7 @@ import os
 import uuid
 from .llm_client import PDF_GUIDANCE_RESPONSE_FORMAT, call_llama_inference
 from .llm_retrieval import retrieve_steering_for_inference
+from vectors.personalization_sync import get_user_vector_status, sync_user_preference_vectors
 
 logger = logging.getLogger(__name__)
 
@@ -219,10 +220,50 @@ def personalization_view(request):
     profile.prepared_items = d['prepared_items']
     profile.appointment_outcome = d['appointment_outcome']
     profile.family_history = (d['family_history'] or '').strip()
+    profile.ml_preferences = d.get('ml_preferences') or []
     profile.is_completed = True
     profile.save()
 
+    try:
+        sync_user_preference_vectors(user_id=int(request.user.id))
+    except Exception:
+        logger.exception("personalization vector sync failed for user %s", request.user.id)
+
     return Response(PersonalizationProfileSerializer(profile).data)
+
+
+@api_view(['GET'])
+def personalization_ml_status_view(request):
+    profile = PersonalizationProfile.objects.filter(user=request.user).first()
+    status_payload = {
+        'profile_completed': bool(profile and profile.is_completed),
+        'profile_updated_at': profile.updated_at if profile else None,
+    }
+    try:
+        status_payload['vector_status'] = get_user_vector_status(user_id=int(request.user.id))
+    except Exception as exc:
+        logger.exception("vector status lookup failed for user %s", request.user.id)
+        status_payload['vector_status'] = {'enabled': False, 'error': str(exc)}
+    return Response(status_payload)
+
+
+@api_view(['POST'])
+def personalization_ml_refresh_view(request):
+    body = request.data if isinstance(request.data, dict) else {}
+    reason = str(body.get('reason') or '').strip()
+    extra_contexts = []
+    if reason:
+        extra_contexts.append(f"Refresh reason: {reason}")
+
+    try:
+        result = sync_user_preference_vectors(
+            user_id=int(request.user.id),
+            extra_contexts=extra_contexts,
+        )
+        return Response({'ok': True, 'sync': result})
+    except Exception as exc:
+        logger.exception("manual vector refresh failed for user %s", request.user.id)
+        return Response({'ok': False, 'detail': 'vector_refresh_failed', 'error': str(exc)}, status=503)
 
 
 @api_view(['GET'])
@@ -980,21 +1021,16 @@ def audio_extract_entities_view(request, pk):
             delta = reconcile_from_voice(user=request.user, candidates=medications_for_reconcile)
             delta_summary = delta.summary()
             if not delta.is_empty():
-                # Kick off the steering-vector derivation for "medication_update"
-                # context. Best-effort: failures don't block the API response.
+                # Rebuild user vectors to include updated medication state.
                 try:
-                    from django.core.management import call_command
-                    call_command(
-                        'derive_user_preferences',
-                        user_id=request.user.id,
-                        source='clinical_update',
-                        content=(
-                            'Medication update from appointment recording: '
-                            + delta.summary()
-                        ),
+                    sync_user_preference_vectors(
+                        user_id=int(request.user.id),
+                        extra_contexts=[
+                            'Medication update from appointment recording: ' + delta.summary()
+                        ],
                     )
                 except Exception:
-                    logger.exception("derive_user_preferences trigger failed")
+                    logger.exception("vector sync after extraction failed")
         except Exception:
             logger.exception("Medication reconciliation failed")
 

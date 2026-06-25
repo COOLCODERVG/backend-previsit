@@ -1,12 +1,31 @@
 from __future__ import annotations
 
+import logging
+import os
 import uuid
 from django.db import models
 
 try:
     from pgvector.django import VectorField
-except Exception:  # pragma: no cover
+    _VECTOR_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover
     VectorField = None
+    _VECTOR_IMPORT_ERROR = exc
+
+logger = logging.getLogger(__name__)
+
+_REQUIRE_PGVECTOR = (os.environ.get("REQUIRE_PGVECTOR") or "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+if VectorField is None:
+    msg = "pgvector unavailable; semantic_vec will use JSONField fallback and ANN retrieval will be disabled"
+    if _REQUIRE_PGVECTOR:
+        raise RuntimeError(f"{msg}. Set up pgvector/psycopg correctly.") from _VECTOR_IMPORT_ERROR
+    logger.warning(msg)
 
 
 class PreferenceContext(models.Model):

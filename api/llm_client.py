@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any, Dict, List, Optional
 
@@ -8,6 +9,7 @@ import requests
 
 # Default matches NeuraVia spec (host should pin exact revision in inference image).
 DEFAULT_LLM_MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
+logger = logging.getLogger(__name__)
 
 VISIT_ONE_PAGER_RESPONSE_FORMAT: Dict[str, Any] = {
     "type": "json",
@@ -91,6 +93,7 @@ def call_llama_inference(
 ) -> Optional[Dict[str, Any]]:
     url = _inference_url()
     if not url:
+        logger.warning("LLM inference skipped: LLM_INFERENCE_URL is not configured")
         return None
 
     body = build_inference_request(
@@ -101,10 +104,18 @@ def call_llama_inference(
         response_format=response_format,
     )
     try:
+        logger.info(
+            "llm_inference request task=%s model=%s steering_vectors=%s response_format=%s",
+            task,
+            body.get("model"),
+            len(steering_vectors or []),
+            bool(response_format),
+        )
         resp = requests.post(f"{url}/v1/generate", json=body, timeout=timeout_seconds)
         resp.raise_for_status()
         data = resp.json()
     except Exception:
+        logger.exception("llm_inference request failed task=%s url=%s", task, url)
         return None
 
     if not isinstance(data, dict):

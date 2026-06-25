@@ -161,6 +161,7 @@ class PersonalizationProfileSerializer(serializers.ModelSerializer):
             'prepared_items',
             'appointment_outcome',
             'family_history',
+            'ml_preferences',
             'is_completed',
             'updated_at',
         ]
@@ -169,19 +170,37 @@ class PersonalizationProfileSerializer(serializers.ModelSerializer):
 class PersonalizationProfileUpdateSerializer(serializers.Serializer):
     PREPARED_ITEM_CHOICES = {'notes', 'test_results_labs', 'medications_list', 'nothing_yet'}
 
-    main_reason = serializers.CharField()
-    condition_stage = serializers.ChoiceField(choices=[choice[0] for choice in PersonalizationProfile.CONDITION_STAGE_CHOICES])
-    biggest_concern = serializers.CharField()
-    prepared_items = serializers.ListField(child=serializers.CharField(), allow_empty=False)
+    main_reason = serializers.CharField(required=False, allow_blank=True, default='')
+    condition_stage = serializers.ChoiceField(
+        choices=[choice[0] for choice in PersonalizationProfile.CONDITION_STAGE_CHOICES],
+        required=False,
+        default='not_sure',
+    )
+    biggest_concern = serializers.CharField(required=False, allow_blank=True, default='')
+    prepared_items = serializers.ListField(child=serializers.CharField(), required=False, allow_empty=True, default=list)
     appointment_outcome = serializers.ChoiceField(
-        choices=[choice[0] for choice in PersonalizationProfile.APPOINTMENT_OUTCOME_CHOICES]
+        choices=[choice[0] for choice in PersonalizationProfile.APPOINTMENT_OUTCOME_CHOICES],
+        required=False,
+        default='heard_understood',
     )
     family_history = serializers.CharField(required=False, allow_blank=True, default='')
+    ml_preferences = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+
+    def validate_ml_preferences(self, value):
+        cleaned = []
+        for item in value or []:
+            if not isinstance(item, dict):
+                continue
+            q = str(item.get('question') or '').strip()
+            a = str(item.get('answer') or '').strip()
+            if q:
+                cleaned.append({'question': q, 'answer': a})
+        return cleaned
 
     def validate_prepared_items(self, value):
         cleaned = [item.strip() for item in value if item and item.strip()]
         if not cleaned:
-            raise serializers.ValidationError('Select at least one prepared item')
+            return ['nothing_yet']
 
         invalid = [item for item in cleaned if item not in self.PREPARED_ITEM_CHOICES]
         if invalid:
@@ -192,3 +211,14 @@ class PersonalizationProfileUpdateSerializer(serializers.Serializer):
             raise serializers.ValidationError('"nothing_yet" cannot be combined with other prepared items')
 
         return unique_items
+
+    def validate(self, attrs):
+        prefs = attrs.get('ml_preferences') or []
+        # If ML onboarding answers are present, legacy fields can be soft-defaulted.
+        if prefs:
+            attrs.setdefault('main_reason', '')
+            attrs.setdefault('condition_stage', 'not_sure')
+            attrs.setdefault('biggest_concern', '')
+            attrs.setdefault('prepared_items', ['nothing_yet'])
+            attrs.setdefault('appointment_outcome', 'heard_understood')
+        return attrs

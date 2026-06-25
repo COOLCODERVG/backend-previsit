@@ -91,8 +91,8 @@ else:
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.postgresql",
-            "NAME": os.environ.get("DB_NAME", "postgres"),
-            "USER": os.environ.get("DB_USER", "postgres"),
+            "NAME": os.environ.get("DB_NAME", "syniviadb"),
+            "USER": os.environ.get("DB_USER", "syniviaadmin"),
             "PASSWORD": os.environ.get("DB_PASSWORD", ""),
             "HOST": os.environ.get("DB_HOST", "syniviadb.crk4uo2kehfn.us-west-2.rds.amazonaws.com"),
             "PORT": os.environ.get("DB_PORT", "5432"),

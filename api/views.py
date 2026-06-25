@@ -142,10 +142,16 @@ def login_view(request):
     try:
         user = User.objects.get(email=email)
     except User.DoesNotExist:
-        return Response({'detail': 'Invalid email or password'}, status=401)
+        return Response({'detail': 'Incorrect username or password'}, status=401)
+    except Exception as e:
+        # Log database or other errors for debugging, but return generic auth error to user
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.exception("Login error for email=%s", email)
+        return Response({'detail': 'Incorrect username or password'}, status=401)
 
     if not user.check_password(password):
-        return Response({'detail': 'Invalid email or password'}, status=401)
+        return Response({'detail': 'Incorrect username or password'}, status=401)
 
     profile, _ = PersonalizationProfile.objects.get_or_create(user=user)
     refresh = RefreshToken.for_user(user)

@@ -17,11 +17,11 @@ import requests
 logger = logging.getLogger(__name__)
 
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
-DEFAULT_TITLE = "NeuraVia"
+DEFAULT_TITLE = "SyniVia"
 DEFAULT_BODY = "Time for your medication"
-DEFAULT_DEEP_LINK = "neuraviapre:///medications"
+DEFAULT_DEEP_LINK = "synivia:///medications"
 SUMMARY_BODY = "Your visit summary is ready to review."
-SUMMARY_DEEP_LINK_TEMPLATE = "neuraviapre:///appointment/{appointment_id}/summary"
+SUMMARY_DEEP_LINK_TEMPLATE = "synivia:///appointment/{appointment_id}/summary"
 
 
 @dataclass

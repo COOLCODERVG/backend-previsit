@@ -42,7 +42,7 @@ from .s3 import (
     put_bytes,
     put_pdf_bytes,
 )
-from .transcribe_medical import start_medical_job, get_medical_job_status
+from .transcribe_medical import start_medical_job, get_medical_job_status, wait_for_job
 import os
 import uuid
 from .llm_client import PDF_GUIDANCE_RESPONSE_FORMAT, call_llama_inference
@@ -97,7 +97,7 @@ def _load_transcript_bytes_from_uri(uri: str) -> bytes:
     if parsed:
         bucket, key = parsed
         return get_bytes(bucket=bucket, key=key)
-    req = urllib.request.Request(uri, headers={"User-Agent": "NeuraVia-PreVisit/1.0"})
+    req = urllib.request.Request(uri, headers={"User-Agent": "SyniVia/1.0"})
     with urllib.request.urlopen(req, timeout=60) as resp:
         return resp.read()
 
@@ -366,7 +366,7 @@ def action_plan_view(request):
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def root_view(request):
-    return Response({'message': 'PreVisit API is running (Django)', 'version': '2.0.0'})
+    return Response({'message': 'SyniVia API is running (Django)', 'version': '2.0.0'})
 
 
 @api_view(['GET'])
@@ -752,6 +752,74 @@ def recording_detail_view(request, pk):
 
 
 # ============== Audio Upload + Transcription (NeuraVia) ==============
+
+@api_view(['POST'])
+def voice_dump_transcribe_view(request):
+    """
+    Transcribe a short ad-hoc voice note for text fields.
+    Request body:
+      - audio_base64: base64-encoded audio bytes
+      - audio_content_type: optional, defaults to audio/mp4
+    """
+    body = request.data if isinstance(request.data, dict) else {}
+    audio_base64 = str(body.get('audio_base64') or '').strip()
+    if not audio_base64:
+        return Response({'detail': 'audio_base64 is required'}, status=400)
+
+    content_type = (str(body.get('audio_content_type') or '').strip() or 'audio/mp4')
+    bucket = os.environ.get('S3_AUDIO_BUCKET', '').strip()
+    if not bucket:
+        return Response({'detail': 'S3_AUDIO_BUCKET is not configured'}, status=500)
+
+    try:
+        audio_bytes = _decode_audio_base64(audio_base64)
+    except Exception:
+        return Response({'detail': 'Invalid audio_base64 payload'}, status=400)
+
+    if not audio_bytes:
+        return Response({'detail': 'Audio payload is empty'}, status=400)
+
+    object_key = f"audio/voice-dump/u{request.user.id}/{uuid.uuid4().hex}.bin"
+    try:
+        put_bytes(bucket=bucket, key=object_key, body=audio_bytes, content_type=content_type)
+    except Exception:
+        logger.exception("voice-dump: failed to upload audio")
+        return Response({'detail': 'Failed to upload voice note'}, status=500)
+
+    media_uri = f"s3://{bucket}/{object_key}"
+    job_name = f"nv_vdump_u{request.user.id}_{uuid.uuid4().hex[:10]}"
+
+    try:
+        start_medical_job(job_name=job_name, media_s3_uri=media_uri)
+        job = wait_for_job(job_name=job_name, timeout_seconds=45, poll_seconds=3)
+    except Exception:
+        logger.exception("voice-dump: failed to transcribe")
+        return Response({'detail': 'Failed to start transcription'}, status=502)
+
+    status_value = (job.get('TranscriptionJobStatus') or '').lower()
+    if status_value != 'completed':
+        return Response(
+            {
+                'status': status_value or 'failed',
+                'transcript': '',
+                'detail': 'Transcription did not complete in time',
+            },
+            status=202,
+        )
+
+    uri = ((job.get('Transcript') or {}).get('TranscriptFileUri') or '').strip()
+    if not uri:
+        return Response({'status': 'completed', 'transcript': ''})
+
+    try:
+        raw = _load_transcript_bytes_from_uri(uri)
+        data = json.loads(raw.decode('utf-8'))
+        transcript = _transcript_text_from_aws_json(data)
+    except Exception:
+        logger.exception("voice-dump: transcript fetch/parse failed")
+        return Response({'detail': 'Failed to parse transcript'}, status=502)
+
+    return Response({'status': 'completed', 'transcript': transcript or ''})
 
 @api_view(['POST'])
 def audio_upload_init_view(request):
@@ -1205,7 +1273,7 @@ def export_summary_pdf_view(request, pk):
         pdf_bytes = html_to_pdf_bytes(html)
         doctor = (summary_payload.get("appointment") or {}).get("doctor_name") or "appointment"
         apt_date = (summary_payload.get("appointment") or {}).get("appointment_date") or timezone.now().strftime("%Y-%m-%d")
-        filename = f"NeuraVia_{doctor.replace(' ', '_')}_{apt_date}.pdf"
+        filename = f"SyniVia_{doctor.replace(' ', '_')}_{apt_date}.pdf"
     except RuntimeError as exc:
         return Response({'detail': str(exc)}, status=500)
 

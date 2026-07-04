@@ -13,6 +13,7 @@ import requests
 
 from .llm_client import call_llama_pdf_guidance, call_llama_visit_one_pager
 from .llm_retrieval import build_pdf_guidance_retrieval_query, retrieve_steering_for_inference
+from .rag_retrieval import retrieve_rag_context
 
 logger = logging.getLogger(__name__)
 
@@ -383,18 +384,34 @@ def generate_visit_one_pager(summary_payload, *, view_mode="standard", user_id=N
     llm_payload["view_mode"] = view_mode
     llm_payload["llm_input_coverage"] = assess_llm_input_coverage(summary_payload)
 
+    retrieval_query = None
+    try:
+        retrieval_query = build_pdf_guidance_retrieval_query(llm_payload)
+    except Exception:
+        logger.exception("one_pager retrieval query build failed for user=%s", user_id)
+
     steering_vectors = []
     try:
-        if user_id:
-            rq = build_pdf_guidance_retrieval_query(llm_payload)
+        if user_id and retrieval_query:
             steering_vectors = retrieve_steering_for_inference(
                 user_id=int(user_id),
-                query_text=rq or None,
+                query_text=retrieval_query,
                 top_k=5,
             )
     except Exception:
         logger.exception("one_pager steering retrieval failed for user=%s", user_id)
         steering_vectors = []
+
+    # Knowledge-base RAG context (machinelearning/rag/pipeline.py via the embedding
+    # service) -- independent of personalization steering and of user_id, since the
+    # knowledge base (appointment prep FAQ/medications/notes) isn't user-specific.
+    try:
+        rag = retrieve_rag_context(retrieval_query or "", top_k=5)
+        if rag.get("rag_context"):
+            llm_payload["rag_context"] = rag["rag_context"]
+            llm_payload["rag_citations"] = rag["rag_citations"]
+    except Exception:
+        logger.exception("one_pager RAG retrieval failed for user=%s", user_id)
 
     raw = call_llama_visit_one_pager(
         deidentified_payload=llm_payload,
@@ -413,18 +430,31 @@ def generate_llm_pdf_guidance(summary_payload, export_preferences=None, user_id=
         export_preferences,
         user_id=user_id,
     )
+    retrieval_query = None
+    try:
+        retrieval_query = build_pdf_guidance_retrieval_query(llm_payload)
+    except Exception:
+        logger.exception("pdf_guidance retrieval query build failed for user=%s", user_id)
+
     steering_vectors = []
     try:
-        if user_id:
-            rq = build_pdf_guidance_retrieval_query(llm_payload)
+        if user_id and retrieval_query:
             steering_vectors = retrieve_steering_for_inference(
                 user_id=int(user_id),
-                query_text=rq or None,
+                query_text=retrieval_query,
                 top_k=5,
             )
     except Exception:
         logger.exception("pdf_guidance steering retrieval failed for user=%s", user_id)
         steering_vectors = []
+
+    try:
+        rag = retrieve_rag_context(retrieval_query or "", top_k=5)
+        if rag.get("rag_context"):
+            llm_payload["rag_context"] = rag["rag_context"]
+            llm_payload["rag_citations"] = rag["rag_citations"]
+    except Exception:
+        logger.exception("pdf_guidance RAG retrieval failed for user=%s", user_id)
 
     guidance = call_llama_pdf_guidance(
         deidentified_payload=llm_payload,

@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+from django.conf import settings
 from django.db import models
 
 
 class ExportedPdf(models.Model):
     """
-    Stored in the `documents` DB (RDS #3). No cross-db foreign keys.
+    Exported visit-summary PDF metadata, stored as a table in the single
+    unified application database (alongside every other model).
     """
 
     id = models.BigAutoField(primary_key=True)
-    user_id = models.BigIntegerField(db_index=True)
-    appointment_id = models.BigIntegerField(db_index=True)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="exported_pdfs",
+        db_index=True,
+    )
+    appointment = models.ForeignKey(
+        "api.Appointment",
+        on_delete=models.CASCADE,
+        related_name="exported_pdfs",
+        db_index=True,
+    )
 
     filename = models.CharField(max_length=255)
     s3_bucket = models.CharField(max_length=255, blank=True, default="")
@@ -26,6 +38,6 @@ class ExportedPdf(models.Model):
         db_table = "exported_pdfs"
         ordering = ["-created_at"]
         indexes = [
-            models.Index(fields=["user_id", "appointment_id", "created_at"]),
+            models.Index(fields=["user", "appointment", "created_at"]),
         ]
 

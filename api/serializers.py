@@ -92,6 +92,8 @@ class NoteCreateSerializer(serializers.Serializer):
 
 class RecordingSerializer(serializers.ModelSerializer):
     appointment_id = serializers.IntegerField(source='appointment.id', read_only=True)
+    expires_at = serializers.DateTimeField(read_only=True)
+    is_expired = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Recording
@@ -107,11 +109,15 @@ class RecordingSerializer(serializers.ModelSerializer):
             'audio_size_bytes',
             'created_at',
             'updated_at',
+            'expires_at',
+            'is_expired',
         ]
 
 
 class RecordingDetailSerializer(serializers.ModelSerializer):
     appointment_id = serializers.IntegerField(source='appointment.id', read_only=True)
+    expires_at = serializers.DateTimeField(read_only=True)
+    is_expired = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Recording
@@ -131,6 +137,8 @@ class RecordingDetailSerializer(serializers.ModelSerializer):
             'extracted_entities',
             'created_at',
             'updated_at',
+            'expires_at',
+            'is_expired',
         ]
 
 
@@ -161,7 +169,11 @@ class PersonalizationProfileSerializer(serializers.ModelSerializer):
             'prepared_items',
             'appointment_outcome',
             'family_history',
+            'age',
+            'gender',
+            'region',
             'ml_preferences',
+            'average_appointment_minutes',
             'is_completed',
             'updated_at',
         ]
@@ -184,7 +196,11 @@ class PersonalizationProfileUpdateSerializer(serializers.Serializer):
         default='heard_understood',
     )
     family_history = serializers.CharField(required=False, allow_blank=True, default='')
+    age = serializers.CharField(required=False, allow_blank=True, default='')
+    gender = serializers.CharField(required=False, allow_blank=True, default='')
+    region = serializers.CharField(required=False, allow_blank=True, default='')
     ml_preferences = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+    average_appointment_minutes = serializers.IntegerField(required=False, min_value=5, max_value=240, default=30)
 
     def validate_ml_preferences(self, value):
         cleaned = []

@@ -1,8 +1,6 @@
 param(
   [string]$SqlitePath = ".\\db.sqlite3",
-  [string]$CoreDbUrl = "postgresql://postgres:postgres@localhost:5432/neuravia_core",
-  [string]$VectorsDbUrl = "",
-  [string]$DocsDbUrl = ""
+  [string]$CoreDbUrl = "postgresql://postgres:postgres@localhost:5432/neuravia_core"
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,10 +18,10 @@ if (!(Test-Path $SqlitePath)) {
 
 # Ensure SQLite schema is up to date with current models before dumping.
 Write-Host "Running migrations on SQLite (to align schema for export)..."
-python manage.py migrate --database default
+python manage.py migrate
 
-# Dump only app data (avoid Django auth tables which may not exist in the sqlite file).
-python manage.py dumpdata api medications `
+# Dump all app data — vectors/documents now live as tables in the same database as everything else.
+python manage.py dumpdata api medications vectors documents `
   --indent 2 `
   --output $dumpFile
 
@@ -33,31 +31,15 @@ if (!(Test-Path $dumpFile)) {
 
 Write-Host "Dump written to $dumpFile"
 
-# 2) Point Django to Postgres and run migrations
-Write-Host "Running migrations on Postgres (core/vectors/documents)..."
+# 2) Point Django to the single unified Postgres database and run migrations
+Write-Host "Running migrations on Postgres..."
 $env:CORE_DATABASE_URL = $CoreDbUrl
-$VectorsDbUrl = $VectorsDbUrl.Trim()
-$DocsDbUrl = $DocsDbUrl.Trim()
-
-if ($VectorsDbUrl -ne "") {
-  $env:VECTORS_DATABASE_URL = $VectorsDbUrl
-} else {
-  $env:VECTORS_DATABASE_URL = $CoreDbUrl
-}
-
-if ($DocsDbUrl -ne "") {
-  $env:DOCS_DATABASE_URL = $DocsDbUrl
-} else {
-  $env:DOCS_DATABASE_URL = $CoreDbUrl
-}
 $env:DJANGO_SETTINGS_MODULE = "previsit.settings"
 
-python manage.py migrate --database default
-python manage.py migrate --database vectors
-python manage.py migrate --database documents
+python manage.py migrate
 
-# 3) Load the dumped data into the core DB
-Write-Host "Importing dumped data into Postgres core DB..."
+# 3) Load the dumped data into the unified database
+Write-Host "Importing dumped data into Postgres..."
 $dumpPath = (Resolve-Path $dumpFile).Path
 python manage.py loaddata $dumpPath
 

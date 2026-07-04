@@ -26,11 +26,14 @@ poison ANN search.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 import requests
+
+from . import ml_bridge
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +123,21 @@ def extract_residual_activations(
 
 # --------------------------------------------------------------------------- #
 # PCA / UMAP                                                                  #
+#                                                                              #
+# Both are delegated to the embedding service's /v1/reduce/pca and           #
+# /v1/reduce/umap endpoints (see vectors.ml_bridge), which are themselves    #
+# thin wrappers around machinelearning/utils/pca.py and                     #
+# utils/umap_reduce.py -- the single source of truth. Nothing here           #
+# reimplements sklearn/UMAP; Django only makes the HTTP call and applies a   #
+# couple of degenerate-input guards (single context / all-identical         #
+# contexts) that are cheap enough to stay local and avoid a pointless        #
+# round-trip for trivial inputs.                                             #
 # --------------------------------------------------------------------------- #
+
+def _l2_normalize(vec: Sequence[float]) -> List[float]:
+    norm = math.sqrt(sum(float(x) * float(x) for x in vec)) or 1.0
+    return [float(x) / norm for x in vec]
+
 
 def derive_pca_direction(
     activations: Sequence[Sequence[float]],
@@ -131,34 +148,31 @@ def derive_pca_direction(
 
     `activations` is a [n_contexts, hidden_dim] matrix. When n_contexts == 1
     we return the single vector (normalized). When all rows are identical the
-    explained variance is 1.0 and we return that direction.
+    explained variance is 1.0 and we return that direction. Otherwise this
+    calls the embedding service's PCA endpoint
+    (`machinelearning/utils/pca.py::fit_pca`) and takes its leading component.
     """
-    import numpy as np
-
-    arr = np.asarray(activations, dtype=np.float32)
-    if arr.ndim != 2 or arr.shape[0] == 0:
+    arr = [list(row) for row in activations]
+    if not arr:
         raise ValueError("activations must be a non-empty 2D matrix")
 
-    if arr.shape[0] == 1:
-        v = arr[0]
-        n = float(np.linalg.norm(v)) or 1.0
-        return (v / n).tolist(), 1.0
+    if len(arr) == 1:
+        return _l2_normalize(arr[0]), 1.0
 
-    # Center the rows; PCA is meaningful only on centered data.
-    centered = arr - arr.mean(axis=0, keepdims=True)
-    if not np.any(centered):
-        v = arr[0]
-        n = float(np.linalg.norm(v)) or 1.0
-        return (v / n).tolist(), 1.0
+    first = arr[0]
+    if all(row == first for row in arr[1:]):
+        return _l2_normalize(first), 1.0
 
-    from sklearn.decomposition import PCA
-
-    k = max(1, min(int(n_components), centered.shape[0] - 1, centered.shape[1]))
-    pca = PCA(n_components=k)
-    pca.fit(centered)
-    direction = pca.components_[0]
-    n = float(np.linalg.norm(direction)) or 1.0
-    return (direction / n).tolist(), float(pca.explained_variance_ratio_[0])
+    result = ml_bridge.reduce_pca(arr, n_components=n_components)
+    if not result:
+        raise RuntimeError(
+            "EMBEDDING_SERVICE_URL is unreachable/unconfigured -- cannot derive PCA steering direction"
+        )
+    components = result.get("components") or []
+    if not components:
+        raise RuntimeError(f"PCA endpoint returned no components: {result!r}")
+    variances = result.get("explained_variance_ratio") or [0.0]
+    return _l2_normalize(components[0]), float(variances[0])
 
 
 def umap_cluster_quality(activations: Sequence[Sequence[float]]) -> tuple[float, bool]:
@@ -166,34 +180,29 @@ def umap_cluster_quality(activations: Sequence[Sequence[float]]) -> tuple[float,
 
     Returns (silhouette_score, meaningful_bool). With fewer than 4 contexts
     the test is degenerate; we return 0.0 / False without raising so the
-    worker can still persist what it has.
+    worker can still persist what it has. Delegates the actual UMAP
+    projection + K-Means/silhouette check to the embedding service
+    (`machinelearning/utils/umap_reduce.py` + `utils/clustering.py`) via
+    `vectors.ml_bridge.reduce_umap(..., check_clusters=True)`; the meaningful
+    threshold itself stays local so it remains tunable via
+    `STEERING_UMAP_MIN_SILHOUETTE` independently of the service's own default.
+
+    Note: the shared `umap_reduce` helper requires >= 10 samples (a
+    deliberate guardrail in the canonical implementation); with 4-9 contexts
+    this will therefore also return 0.0/False rather than attempting a
+    lower-confidence fit. That's an intentional trade-off of reusing the
+    single source of truth's stricter guard instead of a laxer duplicate.
     """
-    import numpy as np
-
-    arr = np.asarray(activations, dtype=np.float32)
-    if arr.shape[0] < 4:
-        return 0.0, False
-    try:
-        import umap
-        from sklearn.cluster import KMeans
-        from sklearn.metrics import silhouette_score
-    except Exception as exc:  # pragma: no cover
-        logger.warning("UMAP/sklearn unavailable, skipping cluster check: %s", exc)
+    if len(activations) < 4:
         return 0.0, False
 
-    try:
-        n_neighbors = min(15, max(2, arr.shape[0] - 1))
-        reducer = umap.UMAP(n_neighbors=n_neighbors, n_components=2, random_state=42)
-        emb = reducer.fit_transform(arr)
-        n_clusters = max(2, min(5, arr.shape[0] // 2))
-        labels = KMeans(n_clusters=n_clusters, n_init="auto", random_state=42).fit_predict(emb)
-        if len(set(labels)) < 2:
-            return 0.0, False
-        score = float(silhouette_score(emb, labels))
-        return score, score >= UMAP_MIN_SILHOUETTE
-    except Exception as exc:  # pragma: no cover
-        logger.info("UMAP sanity check failed: %s", exc)
+    result = ml_bridge.reduce_umap(activations, n_components=2, check_clusters=True)
+    if not result:
+        logger.info("embedding service unavailable/rejected UMAP request; skipping cluster check")
         return 0.0, False
+
+    score = float(result.get("silhouette", 0.0))
+    return score, score >= UMAP_MIN_SILHOUETTE
 
 
 # --------------------------------------------------------------------------- #
@@ -215,8 +224,6 @@ def derive_user_steering(
     per-context explained variance / UMAP score live on each row's
     diagnostics so the worker can decide whether to apply or quarantine.
     """
-    import numpy as np
-
     if not contexts:
         return []
 
@@ -239,8 +246,7 @@ def derive_user_steering(
     direction, explained = derive_pca_direction(activations, n_components=PCA_MAX_COMPONENTS)
     silhouette, meaningful = umap_cluster_quality(activations)
 
-    direction_arr = np.asarray(direction, dtype=np.float32)
-    norm = float(np.linalg.norm(direction_arr))
+    norm = math.sqrt(sum(float(x) * float(x) for x in direction))
 
     results: List[DerivationResult] = []
     for sv in semantic_vecs:

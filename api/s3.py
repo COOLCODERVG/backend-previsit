@@ -83,6 +83,12 @@ def presign_get(*, bucket: str, key: str, expires_seconds: int = 900) -> str:
     return s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires_seconds)
 
 
+def delete_object(*, bucket: str, key: str) -> None:
+    """Permanently delete a single object. Used by the recording-retention purge."""
+    s3 = client()
+    s3.delete_object(Bucket=bucket, Key=key)
+
+
 def parse_s3_uri(uri: str) -> Optional[Tuple[str, str]]:
     if not uri or not uri.startswith("s3://"):
         return None
@@ -121,6 +127,11 @@ def presign_put_audio(*, object_key: str, content_type: str, expires_seconds: in
 
 def presign_get_audio(*, object_key: str, expires_seconds: int = 900) -> str:
     return presign_get(bucket=audio_bucket(), key=object_key, expires_seconds=expires_seconds)
+
+
+def delete_audio_object(*, object_key: str) -> None:
+    """Permanently delete an expired recording's audio object from the audio bucket."""
+    delete_object(bucket=audio_bucket(), key=object_key)
 
 
 def list_audio_objects(*, prefix: str, max_items: int = 200) -> list[Dict[str, Any]]:

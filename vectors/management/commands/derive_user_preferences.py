@@ -66,7 +66,7 @@ def _profile_contexts_for_user(user_id: int) -> List[tuple[str, str]]:
 def _persist(user_id: int, source: str, content: str, derivation) -> tuple[str, str]:
     from vectors.models import PreferenceContext, SteeringVector
 
-    ctx = PreferenceContext.objects.using("vectors").create(
+    ctx = PreferenceContext.objects.create(
         user_id=user_id,
         source=source,
         content=content,
@@ -79,7 +79,7 @@ def _persist(user_id: int, source: str, content: str, derivation) -> tuple[str, 
             "diagnostics": derivation.diagnostics,
         },
     )
-    sv = SteeringVector.objects.using("vectors").create(
+    sv = SteeringVector.objects.create(
         user_id=user_id,
         context_id=ctx.id,
         layer=derivation.layer,

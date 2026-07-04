@@ -15,9 +15,9 @@ import os
 from typing import Any, Dict, List, Optional
 
 import requests
-from django.conf import settings
-from django.db import connections
+from django.db import connection
 
+from vectors.ml_bridge import embed_text as _local_embed_text, local_ann_search as _local_ann_search
 from vectors.models import PreferenceContext, SteeringVector
 
 logger = logging.getLogger(__name__)
@@ -31,10 +31,6 @@ def _llm_base_url() -> str:
     return (os.environ.get("LLM_INFERENCE_URL") or "").strip().rstrip("/")
 
 
-def _vectors_alias() -> str:
-    return "vectors" if "vectors" in settings.DATABASES else "default"
-
-
 def encode_query_text(text: str, *, timeout_seconds: float = 30.0) -> Optional[List[float]]:
     """
     Produce a dense vector for ANN search. Configure one of:
@@ -43,6 +39,10 @@ def encode_query_text(text: str, *, timeout_seconds: float = 30.0) -> Optional[L
 
     Request body: {"text": "..."} (and "input" duplicated for common servers).
     Response: {"embedding": [...]} or {"vector": [...]} or OpenAI-style {"data":[{"embedding":...}]}
+
+    Falls back to the local `machinelearning` sentence-transformer embedder (see
+    `vectors.ml_bridge`) when neither HTTP service is reachable, so embedding still
+    works offline / in local dev without the dedicated embedding container running.
     """
     text = (text or "").strip()
     if not text:
@@ -82,15 +82,19 @@ def encode_query_text(text: str, *, timeout_seconds: float = 30.0) -> Optional[L
                 if isinstance(inner, list) and inner:
                     return [float(x) for x in inner]
 
+    local_vec = _local_embed_text(text)
+    if local_vec:
+        logger.info("encode_query_text: used local machinelearning embedder fallback")
+        return local_vec
+
     return None
 
 
 def _steering_dicts_for_contexts(user_id: int, contexts: List[PreferenceContext], per_context: int = 3) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    alias = _vectors_alias()
     for ctx in contexts:
         steer = list(
-            SteeringVector.objects.using(alias)
+            SteeringVector.objects
             .filter(user_id=user_id, context_id=ctx.id)
             .order_by("-norm", "layer", "-created_at")[:per_context]
         )
@@ -114,47 +118,74 @@ def steering_vectors_recent(
     per_context: int = 3,
     reason: str = "fallback_recent",
 ) -> List[Dict[str, Any]]:
-    alias = _vectors_alias()
     contexts = list(
-        PreferenceContext.objects.using(alias)
+        PreferenceContext.objects
         .filter(user_id=user_id)
         .order_by("-created_at")[:top_k]
     )
     out = _steering_dicts_for_contexts(user_id, contexts, per_context=per_context)
     logger.info(
-        "steering_retrieval mode=recent reason=%s user_id=%s contexts=%s vectors=%s alias=%s",
+        "steering_retrieval mode=recent reason=%s user_id=%s contexts=%s vectors=%s",
         reason,
         user_id,
         len(contexts),
         len(out),
-        alias,
+    )
+    return out
+
+
+def _steering_vectors_local_ann(
+    *, user_id: int, query_vector: List[float], top_k: int, per_context: int, reason: str
+) -> List[Dict[str, Any]]:
+    """ANN over the user's own contexts via the local FAISS bridge (see `vectors.ml_bridge`),
+    used when the active DB connection isn't Postgres/pgvector. Ranks in-memory since one
+    user's context set is small (dozens of rows at most)."""
+    candidates = [
+        (str(ctx.id), ctx.semantic_vec)
+        for ctx in PreferenceContext.objects.filter(user_id=user_id).exclude(semantic_vec=None)
+        if ctx.semantic_vec
+    ]
+    ranked_ids = _local_ann_search(query_vector=query_vector, candidates=candidates, top_k=top_k)
+    if not ranked_ids:
+        return steering_vectors_recent(user_id=user_id, top_k=top_k, per_context=per_context, reason=reason)
+
+    by_id = {str(c.id): c for c in PreferenceContext.objects.filter(id__in=ranked_ids)}
+    contexts = [by_id[i] for i in ranked_ids if i in by_id]
+    out = _steering_dicts_for_contexts(user_id, contexts, per_context=per_context)
+    logger.info(
+        "steering_retrieval mode=local_ann reason=%s user_id=%s contexts=%s vectors=%s",
+        reason,
+        user_id,
+        len(contexts),
+        len(out),
     )
     return out
 
 
 def steering_vectors_ann(*, user_id: int, query_vector: List[float], top_k: int = 5, per_context: int = 3) -> List[Dict[str, Any]]:
-    alias = _vectors_alias()
-    if connections[alias].vendor != "postgresql":
-        return steering_vectors_recent(
+    if connection.vendor != "postgresql":
+        return _steering_vectors_local_ann(
             user_id=user_id,
+            query_vector=query_vector,
             top_k=top_k,
             per_context=per_context,
-            reason=f"non_postgres_backend:{connections[alias].vendor}",
+            reason=f"non_postgres_backend:{connection.vendor}",
         )
     try:
         from pgvector.django import CosineDistance  # type: ignore
 
         semantic_field = PreferenceContext._meta.get_field("semantic_vec")
         if semantic_field.__class__.__name__ != "VectorField":
-            return steering_vectors_recent(
+            return _steering_vectors_local_ann(
                 user_id=user_id,
+                query_vector=query_vector,
                 top_k=top_k,
                 per_context=per_context,
                 reason="semantic_vec_not_vector_field",
             )
 
         qs = (
-            PreferenceContext.objects.using(alias)
+            PreferenceContext.objects
             .filter(user_id=user_id)
             .exclude(semantic_vec=None)
             .annotate(distance=CosineDistance("semantic_vec", query_vector))
@@ -164,11 +195,10 @@ def steering_vectors_ann(*, user_id: int, query_vector: List[float], top_k: int 
         if contexts:
             out = _steering_dicts_for_contexts(user_id, contexts, per_context=per_context)
             logger.info(
-                "steering_retrieval mode=ann user_id=%s contexts=%s vectors=%s alias=%s dim=%s",
+                "steering_retrieval mode=ann user_id=%s contexts=%s vectors=%s dim=%s",
                 user_id,
                 len(contexts),
                 len(out),
-                alias,
                 len(query_vector),
             )
             return out

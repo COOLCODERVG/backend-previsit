@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
-from django.conf import settings
 from django.db import transaction
 
 from api.models import PersonalizationProfile, Question, Recording, Symptom
@@ -13,10 +12,6 @@ from .models import PreferenceContext, SteeringVector
 from .steering_workflow import derive_user_steering
 
 logger = logging.getLogger(__name__)
-
-
-def _vectors_alias() -> str:
-    return "vectors" if "vectors" in settings.DATABASES else "default"
 
 
 def _dedupe_contexts(items: Iterable[Tuple[str, str]]) -> List[Tuple[str, str]]:
@@ -124,15 +119,14 @@ def sync_user_preference_vectors(
             "steering_created": 0,
         }
 
-    alias = _vectors_alias()
     created_contexts = 0
     created_steering = 0
-    with transaction.atomic(using=alias):
-        PreferenceContext.objects.using(alias).filter(user_id=user_id).delete()
-        SteeringVector.objects.using(alias).filter(user_id=user_id).delete()
+    with transaction.atomic():
+        PreferenceContext.objects.filter(user_id=user_id).delete()
+        SteeringVector.objects.filter(user_id=user_id).delete()
 
         for (source, content), d in zip(contexts, derived):
-            ctx = PreferenceContext.objects.using(alias).create(
+            ctx = PreferenceContext.objects.create(
                 user_id=user_id,
                 source=source,
                 content=content,
@@ -147,7 +141,7 @@ def sync_user_preference_vectors(
             )
             created_contexts += 1
 
-            SteeringVector.objects.using(alias).create(
+            SteeringVector.objects.create(
                 user_id=user_id,
                 context_id=ctx.id,
                 layer=d.layer,
@@ -166,9 +160,8 @@ def sync_user_preference_vectors(
 
 
 def get_user_vector_status(*, user_id: int) -> Dict[str, Any]:
-    alias = _vectors_alias()
-    context_qs = PreferenceContext.objects.using(alias).filter(user_id=user_id)
-    steering_qs = SteeringVector.objects.using(alias).filter(user_id=user_id)
+    context_qs = PreferenceContext.objects.filter(user_id=user_id)
+    steering_qs = SteeringVector.objects.filter(user_id=user_id)
     latest_ctx = context_qs.order_by("-created_at").first()
     latest_sv = steering_qs.order_by("-created_at").first()
 
@@ -185,7 +178,6 @@ def get_user_vector_status(*, user_id: int) -> Dict[str, Any]:
 
     return {
         "enabled": True,
-        "db_alias": alias,
         "contexts": context_qs.count(),
         "steering_vectors": steering_qs.count(),
         "semantic_dim": semantic_dim,

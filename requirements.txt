@@ -16,3 +16,12 @@ cryptography==44.0.0
 exponent-server-sdk==2.2.0
 psycopg[binary]==3.2.9
 psycopg2-binary==2.9.10
+
+# NOTE: embeddings/RAG/PCA/UMAP/clustering are intentionally NOT installed here.
+# Per the "models are called via an API, not locally downloaded" requirement,
+# the backend only ever reaches that functionality over HTTP through
+# `vectors.ml_bridge` -> the dedicated embedding/ML service (`services/embedding`,
+# itself a thin wrapper around the `machinelearning/` package -- the single
+# source of truth). If that service is unreachable, `vectors.ml_bridge` and
+# `api.llm_retrieval` degrade to "most recent contexts" rather than trying to
+# run any model in-process here.

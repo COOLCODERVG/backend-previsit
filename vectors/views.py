@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import logging
 
-from django.conf import settings
-from django.db import connections
+from django.db import connection
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from api.llm_retrieval import encode_query_text
 
+from .ml_bridge import local_ann_search
 from .models import PreferenceContext, SteeringVector
 from .serializers import (
     VectorSearchSerializer,
@@ -20,19 +20,14 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 
-def _vectors_alias() -> str:
-    return "vectors" if "vectors" in settings.DATABASES else "default"
-
-
 def _results_for_contexts(*, user_id: int, contexts: list, distances: list | None = None) -> list:
     results = []
-    alias = _vectors_alias()
     for i, ctx in enumerate(contexts):
         dist = None
         if distances is not None and i < len(distances):
             dist = distances[i]
         steer = list(
-            SteeringVector.objects.using(alias)
+            SteeringVector.objects
             .filter(user_id=user_id, context_id=ctx.id)
             .order_by("layer", "-created_at")[:3]
         )
@@ -54,14 +49,26 @@ def _results_for_contexts(*, user_id: int, contexts: list, distances: list | Non
     return results
 
 
+def _recent_contexts_response(*, user_id: int, top_k: int, note: str) -> Response:
+    qs = (
+        PreferenceContext.objects
+        .filter(user_id=user_id)
+        .order_by("-created_at")[:top_k]
+    )
+    contexts = list(qs)
+    logger.info("vector_search mode=recent user_id=%s contexts=%s reason=%s", user_id, len(contexts), note)
+    return Response({"results": _results_for_contexts(user_id=user_id, contexts=contexts, distances=None), "note": note})
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def search_preference_contexts(request):
     """
     ANN search on semantic_vec (pgvector cosine distance) when a query vector is available.
 
-    Pass `query_vector` and/or `query_text`. Text is encoded via EMBEDDING_SERVICE_URL or
-    LLM_INFERENCE_URL `/v1/embed` when a vector is not sent.
+    Pass `query_vector` and/or `query_text`. Text is encoded via EMBEDDING_SERVICE_URL,
+    LLM_INFERENCE_URL `/v1/embed`, or the local `machinelearning` embedder (see `vectors.ml_bridge`)
+    when a vector is not sent.
     """
     s = VectorSearchSerializer(data=request.data)
     s.is_valid(raise_exception=True)
@@ -75,33 +82,36 @@ def search_preference_contexts(request):
         qv = encode_query_text(qt)
 
     note = None
-    alias = _vectors_alias()
     if qv is None and qt:
         note = "embedding_unavailable_fell_back_to_recent"
 
-    if connections[alias].vendor != "postgresql":
-        note = note or f"non_postgres_backend:{connections[alias].vendor}; returned most recent contexts"
-        qs = (
-            PreferenceContext.objects.using(alias)
-            .filter(user_id=user_id)
-            .order_by("-created_at")[:top_k]
+    if connection.vendor != "postgresql":
+        # Non-Postgres backend (e.g. local SQLite dev): rank via the local FAISS bridge
+        # instead of straight "most recent" whenever we have a query vector to work with.
+        if qv is not None:
+            candidates = [
+                (str(ctx.id), ctx.semantic_vec)
+                for ctx in PreferenceContext.objects.filter(user_id=user_id).exclude(semantic_vec=None)
+                if ctx.semantic_vec
+            ]
+            ranked_ids = local_ann_search(query_vector=qv, candidates=candidates, top_k=top_k)
+            if ranked_ids:
+                by_id = {str(c.id): c for c in PreferenceContext.objects.filter(id__in=ranked_ids)}
+                contexts = [by_id[i] for i in ranked_ids if i in by_id]
+                logger.info("vector_search mode=local_ann user_id=%s contexts=%s", user_id, len(contexts))
+                return Response({"results": _results_for_contexts(user_id=user_id, contexts=contexts, distances=None)})
+        return _recent_contexts_response(
+            user_id=user_id,
+            top_k=top_k,
+            note=note or f"non_postgres_backend:{connection.vendor}; returned most recent contexts",
         )
-        contexts = list(qs)
-        logger.info(
-            "vector_search mode=recent user_id=%s contexts=%s alias=%s reason=%s",
-            user_id,
-            len(contexts),
-            alias,
-            note,
-        )
-        return Response({"results": _results_for_contexts(user_id=user_id, contexts=contexts, distances=None), "note": note})
 
     try:
         from pgvector.django import CosineDistance  # type: ignore
 
         if qv is not None:
             qs = (
-                PreferenceContext.objects.using(alias)
+                PreferenceContext.objects
                 .filter(user_id=user_id)
                 .exclude(semantic_vec=None)
                 .annotate(distance=CosineDistance("semantic_vec", qv))
@@ -109,12 +119,7 @@ def search_preference_contexts(request):
             )
             contexts = list(qs)
             dists = [float(getattr(c, "distance", 0.0)) for c in contexts]
-            logger.info(
-                "vector_search mode=ann user_id=%s contexts=%s alias=%s",
-                user_id,
-                len(contexts),
-                alias,
-            )
+            logger.info("vector_search mode=ann user_id=%s contexts=%s", user_id, len(contexts))
             payload = {"results": _results_for_contexts(user_id=user_id, contexts=contexts, distances=dists)}
             if note:
                 payload["note"] = note
@@ -122,24 +127,11 @@ def search_preference_contexts(request):
     except Exception:
         logger.warning("vector_search ANN unavailable; falling back to recent", exc_info=True)
 
-    qs = (
-        PreferenceContext.objects.using(alias)
-        .filter(user_id=user_id)
-        .order_by("-created_at")[:top_k]
+    return _recent_contexts_response(
+        user_id=user_id,
+        top_k=top_k,
+        note=note or "pgvector_not_active_or_no_query_vector; returned most recent contexts",
     )
-    contexts = list(qs)
-    logger.info(
-        "vector_search mode=recent user_id=%s contexts=%s alias=%s reason=%s",
-        user_id,
-        len(contexts),
-        alias,
-        note or "pgvector_not_active_or_no_query_vector",
-    )
-    payload = {
-        "results": _results_for_contexts(user_id=user_id, contexts=contexts, distances=None),
-        "note": note or "pgvector_not_active_or_no_query_vector; returned most recent contexts",
-    }
-    return Response(payload)
 
 
 @api_view(["POST"])
@@ -156,9 +148,8 @@ def upsert_preference_context(request):
     meta = d.get("representation_meta")
     if meta is None:
         meta = {}
-    alias = _vectors_alias()
 
-    ctx = PreferenceContext.objects.using(alias).create(
+    ctx = PreferenceContext.objects.create(
         user_id=int(request.user.id),
         source=(d.get("source") or "signup").strip() or "signup",
         content=d["content"],
@@ -182,9 +173,8 @@ def add_steering_vector(request):
     norm = float(d.get("norm") or 0.0)
     if not norm:
         norm = sum((float(x) * float(x) for x in vec)) ** 0.5
-    alias = _vectors_alias()
 
-    item = SteeringVector.objects.using(alias).create(
+    item = SteeringVector.objects.create(
         user_id=int(request.user.id),
         context_id=d["context_id"],
         layer=int(d["layer"]),

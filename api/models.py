@@ -1,6 +1,8 @@
 from django.db import models
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager
 
+from .recording_retention import compute_expires_at, is_expired as _recording_is_expired
+
 
 class UserManager(BaseUserManager):
     def create_user(self, email, password=None, **extra_fields):
@@ -56,9 +58,18 @@ class PersonalizationProfile(models.Model):
         default='',
     )
     family_history = models.TextField(blank=True, default='')
+    # Profile basics (Settings > Profile — Instagram-style structured layout).
+    age = models.CharField(max_length=10, blank=True, default='')
+    gender = models.CharField(max_length=30, blank=True, default='')
+    # IANA timezone identifier (e.g. "America/New_York") representing the user's region.
+    region = models.CharField(max_length=64, blank=True, default='')
     # Question/answer rows from ML onboarding (representation-editing preferences).
     # Shape: [{"question": str, "answer": str}, ...]
     ml_preferences = models.JSONField(default=list, blank=True)
+    # User-reported average appointment length in minutes (collected during onboarding).
+    # Used to compute a dynamic recording-retention window (average duration + buffer)
+    # instead of a fixed expiry timer.
+    average_appointment_minutes = models.PositiveIntegerField(default=30)
     is_completed = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -189,3 +200,22 @@ class Recording(models.Model):
     class Meta:
         db_table = 'recordings'
         ordering = ['-created_at']
+
+    @property
+    def _average_appointment_minutes(self) -> int:
+        """The recording owner's typical appointment length, used to size the
+        dynamic retention window. Falls back to 30 minutes if the user has no
+        PersonalizationProfile yet."""
+        try:
+            return self.user.personalization.average_appointment_minutes
+        except PersonalizationProfile.DoesNotExist:
+            return 30
+
+    @property
+    def expires_at(self):
+        """Timestamp after which this recording is purged (audio + row)."""
+        return compute_expires_at(self.created_at, self._average_appointment_minutes)
+
+    @property
+    def is_expired(self) -> bool:
+        return _recording_is_expired(self.created_at, self._average_appointment_minutes)

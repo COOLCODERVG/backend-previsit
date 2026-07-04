@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from django.conf import settings
 from django.db import models
 
 try:
@@ -30,11 +31,17 @@ if VectorField is None:
 
 class PreferenceContext(models.Model):
     """
-    Stored in the `vectors` DB. No cross-db FKs.
+    A user's embedded preference/personalization context, stored as a table in
+    the single unified application database (alongside every other model).
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user_id = models.BigIntegerField(db_index=True)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="preference_contexts",
+        db_index=True,
+    )
     source = models.CharField(max_length=30, default="signup")  # signup|med_update|visit_extract|manual
     content = models.TextField()
 
@@ -44,7 +51,7 @@ class PreferenceContext(models.Model):
     else:
         semantic_vec = models.JSONField(default=list, blank=True)
 
-    # Optional UMAP/PCA / pipeline provenance (RDS #2); does not replace semantic_vec or steering_vec.
+    # Optional UMAP/PCA / pipeline provenance from an offline worker.
     representation_meta = models.JSONField(default=dict, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -52,7 +59,7 @@ class PreferenceContext(models.Model):
     class Meta:
         db_table = "vector_preference_contexts"
         indexes = [
-            models.Index(fields=["user_id", "created_at"]),
+            models.Index(fields=["user", "created_at"]),
         ]
 
 
@@ -63,8 +70,18 @@ class SteeringVector(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    context_id = models.UUIDField(db_index=True)
-    user_id = models.BigIntegerField(db_index=True)
+    context = models.ForeignKey(
+        PreferenceContext,
+        on_delete=models.CASCADE,
+        related_name="steering_vectors",
+        db_index=True,
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="steering_vectors",
+        db_index=True,
+    )
     layer = models.IntegerField(default=0)
     # Store as JSON list of floats to avoid coupling to a specific tensor format.
     steering_vec = models.JSONField(default=list, blank=True)
@@ -74,6 +91,6 @@ class SteeringVector(models.Model):
     class Meta:
         db_table = "vector_steering_vectors"
         indexes = [
-            models.Index(fields=["user_id", "context_id", "layer"]),
+            models.Index(fields=["user", "context", "layer"]),
         ]
 

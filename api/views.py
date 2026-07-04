@@ -33,6 +33,7 @@ from .pdf_renderer import render_summary_html, html_to_pdf_bytes
 from .object_store import resolve_local_store, sniff_audio_content_type
 from .s3 import (
     docs_bucket,
+    delete_audio_object,
     get_bytes,
     list_audio_objects,
     parse_s3_uri,
@@ -191,13 +192,19 @@ def logout_view(request):
     return Response({'message': 'Logged out successfully', 'blacklisted': blacklisted})
 
 
-@api_view(['GET', 'DELETE'])
+@api_view(['GET', 'PATCH', 'DELETE'])
 def me_view(request):
     if request.method == 'DELETE':
         # Deletes the Django user and related rows (CASCADE). Cognito users may
         # still exist until separately removed from the user pool.
         request.user.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    if request.method == 'PATCH':
+        name = request.data.get('name')
+        if isinstance(name, str) and name.strip():
+            request.user.name = name.strip()
+            request.user.save(update_fields=['name'])
 
     profile, _ = PersonalizationProfile.objects.get_or_create(user=request.user)
     return Response({
@@ -226,7 +233,11 @@ def personalization_view(request):
     profile.prepared_items = d['prepared_items']
     profile.appointment_outcome = d['appointment_outcome']
     profile.family_history = (d['family_history'] or '').strip()
+    profile.age = (d.get('age') or '').strip()
+    profile.gender = (d.get('gender') or '').strip()
+    profile.region = (d.get('region') or '').strip()
     profile.ml_preferences = d.get('ml_preferences') or []
+    profile.average_appointment_minutes = d.get('average_appointment_minutes') or 30
     profile.is_completed = True
     profile.save()
 
@@ -656,9 +667,31 @@ def _presign_recording_audio(recording) -> str | None:
         return None
 
 
+def _purge_expired_recordings(user) -> None:
+    """
+    Delete recordings past their dynamic retention window (average appointment
+    length + a 2-hour buffer — see `recording_retention.py`).
+
+    Runs opportunistically whenever this user's recordings are listed/fetched,
+    so no separate scheduled job is required for the recordings to actually
+    become unavailable once they expire. Deletes the S3 audio object (when
+    present) before removing the database row.
+    """
+    for recording in Recording.objects.filter(user=user):
+        if not recording.is_expired:
+            continue
+        if recording.audio_storage == 's3' and recording.audio_object_key:
+            try:
+                delete_audio_object(object_key=recording.audio_object_key)
+            except Exception:
+                logger.exception("Failed to delete expired S3 audio object %s", recording.audio_object_key)
+        recording.delete()
+
+
 @api_view(['GET', 'POST'])
 def recordings_view(request):
     if request.method == 'GET':
+        _purge_expired_recordings(request.user)
         qs = Recording.objects.filter(user=request.user)
         apt_id = request.query_params.get('appointment_id')
         if apt_id:
@@ -742,6 +775,14 @@ def recording_detail_view(request, pk):
         return Response({'detail': 'Recording not found'}, status=404)
 
     if request.method == 'GET':
+        if recording.is_expired:
+            if recording.audio_storage == 's3' and recording.audio_object_key:
+                try:
+                    delete_audio_object(object_key=recording.audio_object_key)
+                except Exception:
+                    logger.exception("Failed to delete expired S3 audio object %s", recording.audio_object_key)
+            recording.delete()
+            return Response({'detail': 'Recording has expired and was removed'}, status=404)
         resp = RecordingDetailSerializer(recording).data
         resp['appointment_id'] = recording.appointment_id
         resp['audio_download_url'] = _presign_recording_audio(recording)
@@ -1119,6 +1160,7 @@ def audio_extract_entities_view(request, pk):
 # ============== Summary View ==============
 
 def build_summary_payload(user, apt):
+    _purge_expired_recordings(user)
     symptoms = Symptom.objects.filter(appointment=apt, user=user)
     questions = Question.objects.filter(appointment=apt, user=user)
     notes = Note.objects.filter(appointment=apt, user=user)
@@ -1298,10 +1340,10 @@ def export_summary_pdf_view(request, pk):
         storage = "local"
         download_url = request.build_absolute_uri(f'/api/exports/{file_id}')
 
-    # Store metadata in documents DB (RDS #3)
+    # Store export metadata (single unified database — documents app tables).
     try:
         from documents.models import ExportedPdf
-        ExportedPdf.objects.using("documents").create(
+        ExportedPdf.objects.create(
             user_id=request.user.id,
             appointment_id=apt.id,
             filename=filename,

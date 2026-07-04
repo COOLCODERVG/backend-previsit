@@ -72,19 +72,10 @@ def _database_from_url(url: str):
 
 
 CORE_DATABASE_URL = os.environ.get("CORE_DATABASE_URL", "").strip()
-VECTORS_DATABASE_URL = os.environ.get("VECTORS_DATABASE_URL", "").strip()
-DOCS_DATABASE_URL = os.environ.get("DOCS_DATABASE_URL", "").strip()
 
-#if CORE_DATABASE_URL:
-#    DATABASES = {"default": _database_from_url(CORE_DATABASE_URL)}
-#else:
-#    DATABASES = {
-#        "default": {
-#            "ENGINE": "django.db.backends.sqlite3",
-#            "NAME": BASE_DIR / "db.sqlite3",
-#        }
-#    }
-
+# Single unified database — user/application data, personalization vectors
+# (pgvector-backed, see the `vectors` app), and document/export metadata (see
+# the `documents` app) all live as separate tables in this one connection.
 if CORE_DATABASE_URL:
     DATABASES = {"default": _database_from_url(CORE_DATABASE_URL)}
 else:
@@ -101,19 +92,6 @@ else:
             },
         }
     }
-
-# Optional: separate RDS instances (or separate DBs) for vectors and documents.
-if VECTORS_DATABASE_URL:
-    DATABASES["vectors"] = _database_from_url(VECTORS_DATABASE_URL)
-if DOCS_DATABASE_URL:
-    DATABASES["documents"] = _database_from_url(DOCS_DATABASE_URL)
-
-# Dev convenience: if core DB is configured but secondary DBs are not,
-# alias them to core so `--database vectors/documents` still works.
-if CORE_DATABASE_URL and "vectors" not in DATABASES:
-    DATABASES["vectors"] = DATABASES["default"]
-if CORE_DATABASE_URL and "documents" not in DATABASES:
-    DATABASES["documents"] = DATABASES["default"]
 
 AUTH_USER_MODEL = 'api.User'
 
@@ -146,9 +124,6 @@ REST_FRAMEWORK = {
     ),
     'EXCEPTION_HANDLER': 'api.utils.custom_exception_handler',
 }
-
-# Route some apps to dedicated databases when configured.
-DATABASE_ROUTERS = ["previsit.db_router.NeuraViaDbRouter"]
 
 # Simple JWT (legacy email/password path)
 SIMPLE_JWT = {

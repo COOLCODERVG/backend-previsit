@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover
 @permission_classes([IsAuthenticated])
 def list_exports(request):
     appointment_id = request.query_params.get("appointment_id")
-    qs = ExportedPdf.objects.using("documents").filter(user_id=request.user.id)
+    qs = ExportedPdf.objects.filter(user_id=request.user.id)
     if appointment_id:
         qs = qs.filter(appointment_id=int(appointment_id))
     data = ExportedPdfSerializer(qs[:50], many=True).data
@@ -29,7 +29,7 @@ def list_exports(request):
 @permission_classes([IsAuthenticated])
 def export_download_url(request, pk: int):
     try:
-        item = ExportedPdf.objects.using("documents").get(pk=pk, user_id=request.user.id)
+        item = ExportedPdf.objects.get(pk=pk, user_id=request.user.id)
     except ExportedPdf.DoesNotExist:
         return Response({"detail": "Export not found"}, status=404)
 

@@ -11,6 +11,7 @@ import base64
 import json
 import logging
 import urllib.request
+import requests
 
 from .models import User, Appointment, Symptom, Feeling, Question, Note, Recording, PersonalizationProfile
 from .serializers import (
@@ -66,6 +67,32 @@ def _decode_audio_base64(b64: str) -> bytes:
     if pad:
         raw += "=" * pad
     return base64.b64decode(raw, validate=False)
+
+
+def _openai_realtime_session():
+    api_key = (os.environ.get('OPENAI_API_KEY') or '').strip()
+    if not api_key:
+        raise RuntimeError('OPENAI_API_KEY is not configured')
+
+    openai_base = (os.environ.get('OPENAI_API_BASE') or 'https://api.openai.com').strip().rstrip('/')
+    url = f'{openai_base}/v1/realtime/sessions'
+    payload = {
+        'model': 'gpt-realtime-whisper',
+        'voice': 'none',
+        'audio': {
+            'sample_rate_hz': 24000,
+            'encoding': 'linear16',
+            'channels': 1,
+        },
+    }
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json',
+    }
+    resp = requests.post(url, json=payload, headers=headers, timeout=15)
+    if resp.status_code != 200:
+        raise RuntimeError(f'OpenAI realtime session failed: {resp.status_code} {resp.text}')
+    return resp.json()
 
 
 def _transcript_text_from_aws_json(data: dict) -> str:
@@ -941,6 +968,22 @@ def audio_objects_list_view(request):
         enriched.append({**it, 'download_url': url})
 
     return Response({'prefix': prefix, 'count': len(enriched), 'items': enriched})
+
+
+@api_view(['POST'])
+def realtime_transcription_session_view(request):
+    """
+    Create an ephemeral OpenAI Realtime session for client-side transcription.
+    """
+    try:
+        session = _openai_realtime_session()
+        return Response({'session': session})
+    except RuntimeError as exc:
+        logger.exception('OpenAI realtime session creation failed')
+        return Response({'detail': str(exc)}, status=500)
+    except Exception:
+        logger.exception('OpenAI realtime session creation failed')
+        return Response({'detail': 'Failed to create realtime transcription session'}, status=502)
 
 
 @api_view(['POST'])

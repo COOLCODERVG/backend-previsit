@@ -51,6 +51,7 @@ urlpatterns = [
     # Audio pipeline (direct-to-S3 + transcription)
     path('audio/uploads', views.audio_upload_init_view),
     path('audio/objects', views.audio_objects_list_view),
+    path('audio/realtime/session', views.realtime_transcription_session_view),
     path('audio/voice-dump/transcribe', views.voice_dump_transcribe_view),
     path('audio/<int:pk>/transcribe', views.audio_transcribe_start_view),
     path('audio/<int:pk>/transcribe/status', views.audio_transcribe_status_view),

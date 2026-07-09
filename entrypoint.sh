@@ -2,6 +2,7 @@
 set -eu
 
 # Run Django migrations against the single unified database.
+
 #
 # RUN_MIGRATIONS=0 disables this entirely (used by the worker task family).
 

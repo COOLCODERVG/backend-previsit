@@ -44,7 +44,7 @@ from .s3 import (
     put_bytes,
     put_pdf_bytes,
 )
-from .transcribe_medical import start_medical_job, get_medical_job_status, wait_for_job
+# AWS/OpenAI transcription pipeline removed. Transcription is now on-device via expo-speech-recognition.
 import os
 import uuid
 from .llm_client import PDF_GUIDANCE_RESPONSE_FORMAT, call_llama_inference
@@ -823,71 +823,11 @@ def recording_detail_view(request, pk):
 
 @api_view(['POST'])
 def voice_dump_transcribe_view(request):
-    """
-    Transcribe a short ad-hoc voice note for text fields.
-    Request body:
-      - audio_base64: base64-encoded audio bytes
-      - audio_content_type: optional, defaults to audio/mp4
-    """
-    body = request.data if isinstance(request.data, dict) else {}
-    audio_base64 = str(body.get('audio_base64') or '').strip()
-    if not audio_base64:
-        return Response({'detail': 'audio_base64 is required'}, status=400)
-
-    content_type = (str(body.get('audio_content_type') or '').strip() or 'audio/mp4')
-    bucket = os.environ.get('S3_AUDIO_BUCKET', '').strip()
-    if not bucket:
-        return Response({'detail': 'S3_AUDIO_BUCKET is not configured'}, status=500)
-
-    try:
-        audio_bytes = _decode_audio_base64(audio_base64)
-    except Exception:
-        return Response({'detail': 'Invalid audio_base64 payload'}, status=400)
-
-    if not audio_bytes:
-        return Response({'detail': 'Audio payload is empty'}, status=400)
-
-    object_key = f"audio/voice-dump/u{request.user.id}/{uuid.uuid4().hex}.bin"
-    try:
-        put_bytes(bucket=bucket, key=object_key, body=audio_bytes, content_type=content_type)
-    except Exception:
-        logger.exception("voice-dump: failed to upload audio")
-        return Response({'detail': 'Failed to upload voice note'}, status=500)
-
-    media_uri = f"s3://{bucket}/{object_key}"
-    job_name = f"nv_vdump_u{request.user.id}_{uuid.uuid4().hex[:10]}"
-
-    try:
-        start_medical_job(job_name=job_name, media_s3_uri=media_uri)
-        job = wait_for_job(job_name=job_name, timeout_seconds=45, poll_seconds=3)
-    except Exception:
-        logger.exception("voice-dump: failed to transcribe")
-        return Response({'detail': 'Failed to start transcription'}, status=502)
-
-    status_value = (job.get('TranscriptionJobStatus') or '').lower()
-    if status_value != 'completed':
-        return Response(
-            {
-                'status': status_value or 'failed',
-                'transcript': '',
-                'detail': 'Transcription did not complete in time',
-            },
-            status=202,
-        )
-
-    uri = ((job.get('Transcript') or {}).get('TranscriptFileUri') or '').strip()
-    if not uri:
-        return Response({'status': 'completed', 'transcript': ''})
-
-    try:
-        raw = _load_transcript_bytes_from_uri(uri)
-        data = json.loads(raw.decode('utf-8'))
-        transcript = _transcript_text_from_aws_json(data)
-    except Exception:
-        logger.exception("voice-dump: transcript fetch/parse failed")
-        return Response({'detail': 'Failed to parse transcript'}, status=502)
-
-    return Response({'status': 'completed', 'transcript': transcript or ''})
+    # Deprecated: server-side audio transcription is no longer supported.
+    # The client should perform on-device transcription with `expo-speech-recognition`
+    # and may POST the resulting transcript to `/api/audio/transcript` to persist
+    # the transcript or request server-side extraction.
+    return Response({'detail': 'Server-side transcription removed. Use on-device expo-speech-recognition.'}, status=410)
 
 @api_view(['POST'])
 def audio_upload_init_view(request):
@@ -935,6 +875,96 @@ def audio_upload_init_view(request):
     }, status=201)
 
 
+@api_view(['POST'])
+def audio_receive_transcript_view(request):
+    """
+    Accept a client-submitted transcript produced by on-device recognition.
+    Request body:
+      - appointment_id: required unless recording_id provided
+      - recording_id: optional existing Recording to attach transcript to
+      - transcript: required text
+      - title: optional title for created Recording
+    """
+    body = request.data if isinstance(request.data, dict) else {}
+    transcript = str(body.get('transcript') or '').strip()
+    if not transcript:
+        return Response({'detail': 'transcript is required'}, status=400)
+
+    recording_id = body.get('recording_id')
+    appointment_id = body.get('appointment_id')
+    title = str(body.get('title') or 'Voice Dump').strip()
+
+    if recording_id:
+        try:
+            recording = Recording.objects.get(pk=int(recording_id), user=request.user)
+        except Exception:
+            return Response({'detail': 'Recording not found'}, status=404)
+        recording.transcript_text = transcript
+        recording.status = 'transcribed'
+        recording.save()
+        return Response({'recording_id': recording.id, 'status': recording.status})
+
+    if not appointment_id:
+        return Response({'detail': 'appointment_id or recording_id is required'}, status=400)
+
+    try:
+        apt = Appointment.objects.get(pk=int(appointment_id), user=request.user)
+    except Exception:
+        return Response({'detail': 'Appointment not found'}, status=404)
+
+    recording = Recording.objects.create(
+        user=request.user,
+        appointment=apt,
+        title=title,
+        duration_seconds=0,
+        audio_storage='inline',
+        audio_content_type='',
+        status='transcribed',
+        transcript_text=transcript,
+    )
+
+    # Immediately run clinical extraction on the submitted transcript and persist results.
+    try:
+        from .clinical_extraction import extract_from_transcript, MedicationCandidate, reconcile_from_voice
+
+        result = extract_from_transcript(recording.transcript_text or '')
+        payload = result.to_payload()
+        medications_for_reconcile = result.medications
+
+        recording.status = 'extracted'
+        recording.extracted_entities = payload
+        recording.save()
+
+        delta_summary = 'no changes'
+        if medications_for_reconcile:
+            try:
+                delta = reconcile_from_voice(user=request.user, candidates=medications_for_reconcile)
+                delta_summary = delta.summary()
+                if not delta.is_empty():
+                    try:
+                        sync_user_preference_vectors(
+                            user_id=int(request.user.id),
+                            extra_contexts=[
+                                'Medication update from appointment recording: ' + delta.summary()
+                            ],
+                        )
+                    except Exception:
+                        logger.exception("vector sync after extraction failed")
+            except Exception:
+                logger.exception("Medication reconciliation failed")
+
+        return Response({
+            'recording_id': recording.id,
+            'status': recording.status,
+            'extracted_entities': recording.extracted_entities,
+            'reconciliation': delta_summary,
+        }, status=201)
+    except Exception as exc:
+        logger.exception('Extraction failed for submitted transcript: %s', exc)
+        # Return created recording but indicate extraction failure
+        return Response({'recording_id': recording.id, 'status': recording.status, 'extraction_error': str(exc)}, status=202)
+
+
 @api_view(['GET'])
 def audio_objects_list_view(request):
     """
@@ -972,137 +1002,21 @@ def audio_objects_list_view(request):
 
 @api_view(['POST'])
 def realtime_transcription_session_view(request):
-    """
-    Create an ephemeral OpenAI Realtime session for client-side transcription.
-    """
-    try:
-        session = _openai_realtime_session()
-        return Response({'session': session})
-    except RuntimeError as exc:
-        logger.exception('OpenAI realtime session creation failed')
-        return Response({'detail': str(exc)}, status=500)
-    except Exception:
-        logger.exception('OpenAI realtime session creation failed')
-        return Response({'detail': 'Failed to create realtime transcription session'}, status=502)
+    # Deprecated: OpenAI realtime sessions are no longer supported.
+    return Response({'detail': 'Realtime OpenAI sessions removed. Use on-device expo-speech-recognition.'}, status=410)
 
 
 @api_view(['POST'])
 def audio_transcribe_start_view(request, pk):
-    """
-    Starts AWS Transcribe Medical for an uploaded audio object.
-    Stores job metadata in Recording.transcript_json.
-    """
-    try:
-        recording = Recording.objects.get(pk=pk, user=request.user)
-    except Recording.DoesNotExist:
-        return Response({'detail': 'Recording not found'}, status=404)
-
-    bucket = os.environ.get("S3_AUDIO_BUCKET", "").strip()
-    if not bucket:
-        return Response({'detail': 'S3_AUDIO_BUCKET is not configured'}, status=500)
-
-    if recording.audio_storage == "s3" and recording.audio_object_key:
-        media_uri = f"s3://{bucket}/{recording.audio_object_key}"
-    elif recording.audio_storage == "local" and recording.audio_object_key:
-        # Promote local/dev audio to S3 so Transcribe can read a consistent s3:// URI.
-        store = resolve_local_store()
-        try:
-            body, meta = store.read_bytes(
-                recording.audio_object_key,
-                content_type=(recording.audio_content_type or "application/octet-stream"),
-            )
-        except Exception:
-            return Response({'detail': 'Recording audio object not found'}, status=400)
-        ct = (recording.audio_content_type or meta.content_type or "application/octet-stream").strip()
-        s3_key = f"audio/u{request.user.id}/apt{recording.appointment_id}/rec{recording.id}_{uuid.uuid4().hex[:8]}.bin"
-        try:
-            digest, size = put_bytes(bucket=bucket, key=s3_key, body=body, content_type=ct)
-        except Exception:
-            return Response({'detail': 'Failed to upload audio to S3 for transcription'}, status=500)
-        recording.audio_storage = "s3"
-        recording.audio_object_key = s3_key
-        recording.audio_content_type = ct
-        recording.audio_sha256 = digest or recording.audio_sha256
-        recording.audio_size_bytes = size or recording.audio_size_bytes
-        recording.save()
-        media_uri = f"s3://{bucket}/{s3_key}"
-    else:
-        return Response({'detail': 'Recording has no audio object to transcribe'}, status=400)
-
-    job_name = f"nv_u{request.user.id}_r{recording.id}_{uuid.uuid4().hex[:10]}"
-
-    try:
-        start = start_medical_job(job_name=job_name, media_s3_uri=media_uri)
-    except Exception as exc:
-        recording.status = 'failed'
-        recording.transcript_json = {'error': str(exc)}
-        recording.save()
-        return Response({'detail': 'Failed to start transcription'}, status=500)
-
-    recording.status = 'transcribing'
-    recording.transcript_json = {
-        **(recording.transcript_json or {}),
-        'provider': 'aws_transcribe_medical',
-        'job_name': start.job_name,
-        'status': start.status,
-        'media_s3_uri': media_uri,
-    }
-    recording.save()
-
-    return Response({'recording_id': recording.id, 'job_name': start.job_name, 'status': start.status})
+    # Deprecated: server-side audio transcription removed. Clients should perform
+    # on-device transcription and POST transcripts to `/api/audio/transcript`.
+    return Response({'detail': 'Server-side transcription removed. Use on-device expo-speech-recognition.'}, status=410)
 
 
 @api_view(['GET'])
 def audio_transcribe_status_view(request, pk):
-    """
-    Returns AWS Transcribe Medical job status and stores terminal results.
-    """
-    try:
-        recording = Recording.objects.get(pk=pk, user=request.user)
-    except Recording.DoesNotExist:
-        return Response({'detail': 'Recording not found'}, status=404)
-
-    job_name = (recording.transcript_json or {}).get('job_name')
-    if not job_name:
-        return Response({'detail': 'No transcription job started for this recording'}, status=400)
-
-    try:
-        job = get_medical_job_status(job_name=job_name)
-    except Exception:
-        return Response({'detail': 'Failed to fetch job status'}, status=500)
-
-    status_value = (job.get('TranscriptionJobStatus') or '').lower()
-    prior_status = recording.status
-    recording.transcript_json = {**(recording.transcript_json or {}), 'aws_job': job}
-    if status_value == 'completed':
-        recording.status = 'transcribed'
-        uri = (job.get('Transcript') or {}).get("TranscriptFileUri")
-        if uri and not (recording.transcript_text or "").strip():
-            try:
-                raw = _load_transcript_bytes_from_uri(uri)
-                data = json.loads(raw.decode("utf-8"))
-                text = _transcript_text_from_aws_json(data)
-                if text:
-                    recording.transcript_text = text
-                tj = recording.transcript_json or {}
-                tj["transcript_file_uri"] = uri
-                tj["transcript_json_preview"] = data if isinstance(data, dict) else {"raw": True}
-                recording.transcript_json = tj
-            except Exception:
-                logger.exception("Failed to load transcript artifact from %s", uri)
-    elif status_value == 'failed':
-        recording.status = 'failed'
-    recording.save()
-
-    if status_value == 'completed' and prior_status != 'transcribed':
-        try:
-            from notifications.dispatch import push_summary_ready_for_user
-
-            push_summary_ready_for_user(request.user.id, recording.appointment_id)
-        except Exception:
-            logger.exception("summary_ready push failed for recording %s", recording.id)
-
-    return Response({'recording_id': recording.id, 'status': job.get('TranscriptionJobStatus'), 'job': job})
+    # Deprecated: server-side transcription status checks removed.
+    return Response({'detail': 'Server-side transcription removed. Use on-device expo-speech-recognition.'}, status=410)
 
 
 @api_view(['POST'])

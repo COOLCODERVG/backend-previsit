@@ -21,7 +21,6 @@ from .serializers import (
     QuestionSerializer, QuestionCreateSerializer,
     NoteSerializer, NoteCreateSerializer,
     RecordingSerializer, RecordingDetailSerializer, RecordingCreateSerializer,
-    AudioUploadInitSerializer,
     PersonalizationProfileSerializer, PersonalizationProfileUpdateSerializer,
 )
 from .utils import (
@@ -32,19 +31,9 @@ from .utils import (
 )
 from .pdf_renderer import render_summary_html, html_to_pdf_bytes
 from .object_store import resolve_local_store, sniff_audio_content_type
-from .s3 import (
-    docs_bucket,
-    delete_audio_object,
-    get_bytes,
-    list_audio_objects,
-    parse_s3_uri,
-    presign_get_audio,
-    presign_get_docs,
-    presign_put_audio,
-    put_bytes,
-    put_pdf_bytes,
-)
-# AWS/OpenAI transcription pipeline removed. Transcription is now on-device via expo-speech-recognition.
+# The legacy server-side transcription pipeline has been removed.
+# Transcription is now performed on-device via expo-speech-recognition.
+# S3 bucket storage has been removed; recordings are stored locally only.
 import os
 import uuid
 from .llm_client import PDF_GUIDANCE_RESPONSE_FORMAT, call_llama_inference
@@ -59,40 +48,6 @@ def _strip_data_url_prefix(b64: str) -> str:
     if s.startswith("data:") and "base64," in s:
         s = s.split("base64,", 1)[-1]
     return s.strip()
-
-
-def _decode_audio_base64(b64: str) -> bytes:
-    raw = _strip_data_url_prefix(b64)
-    pad = (-len(raw)) % 4
-    if pad:
-        raw += "=" * pad
-    return base64.b64decode(raw, validate=False)
-
-
-def _openai_realtime_session():
-    api_key = (os.environ.get('OPENAI_API_KEY') or '').strip()
-    if not api_key:
-        raise RuntimeError('OPENAI_API_KEY is not configured')
-
-    openai_base = (os.environ.get('OPENAI_API_BASE') or 'https://api.openai.com').strip().rstrip('/')
-    url = f'{openai_base}/v1/realtime/sessions'
-    payload = {
-        'model': 'gpt-realtime-whisper',
-        'voice': 'none',
-        'audio': {
-            'sample_rate_hz': 24000,
-            'encoding': 'linear16',
-            'channels': 1,
-        },
-    }
-    headers = {
-        'Authorization': f'Bearer {api_key}',
-        'Content-Type': 'application/json',
-    }
-    resp = requests.post(url, json=payload, headers=headers, timeout=15)
-    if resp.status_code != 200:
-        raise RuntimeError(f'OpenAI realtime session failed: {resp.status_code} {resp.text}')
-    return resp.json()
 
 
 def _transcript_text_from_aws_json(data: dict) -> str:
@@ -684,16 +639,6 @@ def note_detail_view(request, pk):
 
 # ============== Recording Views ==============
 
-def _presign_recording_audio(recording) -> str | None:
-    """Best-effort presigned GET for an S3-backed recording. Returns None on failure."""
-    if recording.audio_storage != 's3' or not recording.audio_object_key:
-        return None
-    try:
-        return presign_get_audio(object_key=recording.audio_object_key, expires_seconds=900)
-    except Exception:
-        return None
-
-
 def _purge_expired_recordings(user) -> None:
     """
     Delete recordings past their dynamic retention window (average appointment
@@ -701,17 +646,11 @@ def _purge_expired_recordings(user) -> None:
 
     Runs opportunistically whenever this user's recordings are listed/fetched,
     so no separate scheduled job is required for the recordings to actually
-    become unavailable once they expire. Deletes the S3 audio object (when
-    present) before removing the database row.
+    become unavailable once they expire.
     """
     for recording in Recording.objects.filter(user=user):
         if not recording.is_expired:
             continue
-        if recording.audio_storage == 's3' and recording.audio_object_key:
-            try:
-                delete_audio_object(object_key=recording.audio_object_key)
-            except Exception:
-                logger.exception("Failed to delete expired S3 audio object %s", recording.audio_object_key)
         recording.delete()
 
 
@@ -727,7 +666,6 @@ def recordings_view(request):
         for r in qs:
             d = RecordingSerializer(r).data
             d['appointment_id'] = r.appointment_id
-            d['audio_download_url'] = _presign_recording_audio(r)
             data.append(d)
         return Response(data)
 
@@ -744,7 +682,7 @@ def recordings_view(request):
         title=d['title'], duration_seconds=d.get('duration_seconds', 0),
     )
 
-    # Backwards-compatible dev path: accept base64 audio, but store as object.
+    # Accept base64 audio and store locally.
     audio_b64 = (d.get('audio_base64') or '').strip()
     if audio_b64:
         object_key = f"audio/u{request.user.id}/apt{apt.id}/rec{recording.id}.bin"
@@ -752,41 +690,13 @@ def recordings_view(request):
             recording.title,
             provided=(d.get('audio_content_type') or '').strip() or None,
         )
-        audio_bucket_name = os.environ.get("S3_AUDIO_BUCKET", "").strip()
-        if audio_bucket_name:
-            try:
-                body = _decode_audio_base64(audio_b64)
-                digest, size = put_bytes(
-                    bucket=audio_bucket_name,
-                    key=object_key,
-                    body=body,
-                    content_type=content_type,
-                )
-                recording.audio_storage = "s3"
-                recording.audio_object_key = object_key
-                recording.audio_sha256 = digest
-                recording.audio_size_bytes = size
-                recording.audio_content_type = content_type
-                recording.status = "uploaded"
-            except Exception:
-                logger.exception("S3 audio upload failed; falling back to local object store")
-                store = resolve_local_store()
-                put = store.put_base64(object_key=object_key, content_base64=audio_b64)
-                recording.audio_storage = "local"
-                recording.audio_object_key = put.object_key
-                recording.audio_sha256 = put.sha256
-                recording.audio_size_bytes = put.size_bytes
-                recording.audio_content_type = content_type
-                recording.status = "uploaded"
-        else:
-            store = resolve_local_store()
-            put = store.put_base64(object_key=object_key, content_base64=audio_b64)
-            recording.audio_storage = "local"
-            recording.audio_object_key = put.object_key
-            recording.audio_sha256 = put.sha256
-            recording.audio_size_bytes = put.size_bytes
-            recording.audio_content_type = content_type
-            recording.status = "uploaded"
+        store = resolve_local_store()
+        put = store.put_base64(object_key=object_key, content_base64=audio_b64)
+        recording.audio_object_key = put.object_key
+        recording.audio_sha256 = put.sha256
+        recording.audio_size_bytes = put.size_bytes
+        recording.audio_content_type = content_type
+        recording.status = "uploaded"
         recording.save()
 
     resp = RecordingSerializer(recording).data
@@ -803,16 +713,10 @@ def recording_detail_view(request, pk):
 
     if request.method == 'GET':
         if recording.is_expired:
-            if recording.audio_storage == 's3' and recording.audio_object_key:
-                try:
-                    delete_audio_object(object_key=recording.audio_object_key)
-                except Exception:
-                    logger.exception("Failed to delete expired S3 audio object %s", recording.audio_object_key)
             recording.delete()
             return Response({'detail': 'Recording has expired and was removed'}, status=404)
         resp = RecordingDetailSerializer(recording).data
         resp['appointment_id'] = recording.appointment_id
-        resp['audio_download_url'] = _presign_recording_audio(recording)
         return Response(resp)
 
     recording.delete()
@@ -828,51 +732,6 @@ def voice_dump_transcribe_view(request):
     # and may POST the resulting transcript to `/api/audio/transcript` to persist
     # the transcript or request server-side extraction.
     return Response({'detail': 'Server-side transcription removed. Use on-device expo-speech-recognition.'}, status=410)
-
-@api_view(['POST'])
-def audio_upload_init_view(request):
-    """
-    Returns a pre-signed S3 PUT URL for direct-to-S3 uploads.
-    Creates a Recording row in `created` state and returns its id + object key.
-    """
-    serializer = AudioUploadInitSerializer(data=request.data)
-    serializer.is_valid(raise_exception=True)
-    d = serializer.validated_data
-
-    try:
-        apt = Appointment.objects.get(pk=d['appointment_id'], user=request.user)
-    except Appointment.DoesNotExist:
-        return Response({'detail': 'Appointment not found'}, status=404)
-
-    content_type = (d.get('content_type') or '').strip() or 'application/octet-stream'
-    object_key = f"audio/u{request.user.id}/apt{apt.id}/{uuid.uuid4().hex}.bin"
-
-    recording = Recording.objects.create(
-        user=request.user,
-        appointment=apt,
-        title=d['title'],
-        duration_seconds=d.get('duration_seconds', 0),
-        status='created',
-        audio_storage='s3',
-        audio_object_key=object_key,
-        audio_content_type=content_type,
-        audio_size_bytes=int(d.get('size_bytes') or 0),
-    )
-
-    try:
-        presigned = presign_put_audio(object_key=object_key, content_type=content_type, expires_seconds=900)
-    except RuntimeError as exc:
-        # If S3 isn't configured, keep the recording but inform the client.
-        return Response({'detail': str(exc)}, status=500)
-
-    return Response({
-        'recording_id': recording.id,
-        'appointment_id': apt.id,
-        'object_key': object_key,
-        'upload_url': presigned.upload_url,
-        'headers': presigned.headers,
-        'expires_seconds': 900,
-    }, status=201)
 
 
 @api_view(['POST'])
@@ -917,7 +776,6 @@ def audio_receive_transcript_view(request):
         appointment=apt,
         title=title,
         duration_seconds=0,
-        audio_storage='inline',
         audio_content_type='',
         status='transcribed',
         transcript_text=transcript,
@@ -965,52 +823,10 @@ def audio_receive_transcript_view(request):
         return Response({'recording_id': recording.id, 'status': recording.status, 'extraction_error': str(exc)}, status=202)
 
 
-@api_view(['GET'])
-def audio_objects_list_view(request):
-    """
-    Lists raw S3 objects under the caller's audio prefix (``audio/u<user_id>/``).
-    Optional ?appointment_id=<n> filters to a specific appointment subprefix.
-    Each item includes a short-lived presigned GET URL.
-
-    This is independent of the Recording table — useful for verifying what's
-    actually in the bucket and for orphaned-file cleanup.
-    """
-    appointment_id = (request.query_params.get('appointment_id') or '').strip()
-    prefix = f"audio/u{request.user.id}/"
-    if appointment_id and appointment_id.isdigit():
-        prefix = f"audio/u{request.user.id}/apt{int(appointment_id)}/"
-
-    try:
-        items = list_audio_objects(prefix=prefix, max_items=200)
-    except RuntimeError as exc:
-        return Response({'detail': str(exc)}, status=500)
-    except Exception:
-        logger.exception("Failed to list S3 audio objects under %s", prefix)
-        return Response({'detail': 'Failed to list audio objects'}, status=500)
-
-    enriched = []
-    for it in items:
-        url = None
-        try:
-            url = presign_get_audio(object_key=it['object_key'], expires_seconds=900)
-        except Exception:
-            url = None
-        enriched.append({**it, 'download_url': url})
-
-    return Response({'prefix': prefix, 'count': len(enriched), 'items': enriched})
-
-
 @api_view(['POST'])
 def realtime_transcription_session_view(request):
-    # Deprecated: OpenAI realtime sessions are no longer supported.
-    return Response({'detail': 'Realtime OpenAI sessions removed. Use on-device expo-speech-recognition.'}, status=410)
-
-
-@api_view(['POST'])
-def audio_transcribe_start_view(request, pk):
-    # Deprecated: server-side audio transcription removed. Clients should perform
-    # on-device transcription and POST transcripts to `/api/audio/transcript`.
-    return Response({'detail': 'Server-side transcription removed. Use on-device expo-speech-recognition.'}, status=410)
+    # Deprecated: realtime transcription sessions are no longer supported.
+    return Response({'detail': 'Realtime transcription sessions are no longer supported.'}, status=410)
 
 
 @api_view(['GET'])
@@ -1278,24 +1094,9 @@ def export_summary_pdf_view(request, pk):
 
     encoded = base64.b64encode(pdf_bytes).decode('utf-8')
 
-    storage = "local"
-    object_key = ""
-    bucket = ""
-    download_url = None
-
-    # Preferred: S3 storage (HIPAA aligned, SSE-KMS).
-    try:
-        object_key = f"pdf/u{request.user.id}/apt{apt.id}/{uuid.uuid4().hex}.pdf"
-        put_pdf_bytes(key=object_key, pdf_bytes=pdf_bytes)
-        bucket = docs_bucket()
-        storage = "s3"
-        download_url = presign_get_docs(key=object_key, expires_seconds=900)
-    except Exception:
-        # Dev fallback: persist locally and expose existing download endpoint.
-        file_id = persist_export_pdf(pdf_bytes, request.user.id, filename)
-        object_key = file_id
-        storage = "local"
-        download_url = request.build_absolute_uri(f'/api/exports/{file_id}')
+    # Persist export locally and expose existing download endpoint.
+    file_id = persist_export_pdf(pdf_bytes, request.user.id, filename)
+    download_url = request.build_absolute_uri(f'/api/exports/{file_id}')
 
     # Store export metadata (single unified database — documents app tables).
     try:
@@ -1304,9 +1105,6 @@ def export_summary_pdf_view(request, pk):
             user_id=request.user.id,
             appointment_id=apt.id,
             filename=filename,
-            storage=storage,
-            s3_bucket=bucket,
-            s3_key=object_key,
             sha256="",
             size_bytes=len(pdf_bytes),
         )

@@ -11,6 +11,7 @@ from botocore.config import Config as BotoConfig
 
 # Default matches NeuraVia spec (host should pin exact revision in inference image).
 DEFAULT_LLM_MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_LLM_INFERENCE_URL = "http://127.0.0.1:11434"
 logger = logging.getLogger(__name__)
 
 VISIT_ONE_PAGER_RESPONSE_FORMAT: Dict[str, Any] = {
@@ -39,7 +40,7 @@ PDF_GUIDANCE_RESPONSE_FORMAT: Dict[str, Any] = {
 
 
 def _inference_url() -> str:
-    return os.environ.get("LLM_INFERENCE_URL", "").strip().rstrip("/")
+    return (os.environ.get("LLM_INFERENCE_URL") or DEFAULT_LLM_INFERENCE_URL).strip().rstrip("/")
 
 
 def _model_id() -> str:

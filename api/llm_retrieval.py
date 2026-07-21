@@ -22,13 +22,15 @@ from vectors.models import PreferenceContext, SteeringVector
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_LLM_INFERENCE_URL = "http://127.0.0.1:11434"
+
 
 def _embedding_service_url() -> str:
     return (os.environ.get("EMBEDDING_SERVICE_URL") or "").strip().rstrip("/")
 
 
 def _llm_base_url() -> str:
-    return (os.environ.get("LLM_INFERENCE_URL") or "").strip().rstrip("/")
+    return (os.environ.get("LLM_INFERENCE_URL") or DEFAULT_LLM_INFERENCE_URL).strip().rstrip("/")
 
 
 def encode_query_text(text: str, *, timeout_seconds: float = 30.0) -> Optional[List[float]]:
@@ -38,7 +40,7 @@ def encode_query_text(text: str, *, timeout_seconds: float = 30.0) -> Optional[L
       - LLM_INFERENCE_URL: POST {url}/v1/embed
 
     Request body: {"text": "..."} (and "input" duplicated for common servers).
-    Response: {"embedding": [...]} or {"vector": [...]} or OpenAI-style {"data":[{"embedding":...}]}
+    Response: {"embedding": [...]} or {"vector": [...]} or API-compatible {"data":[{"embedding":...}]}
 
     Falls back to the local `machinelearning` sentence-transformer embedder (see
     `vectors.ml_bridge`) when neither HTTP service is reachable, so embedding still

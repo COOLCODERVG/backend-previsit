@@ -168,17 +168,11 @@ class Recording(models.Model):
         ('extracted', 'extracted'),
         ('failed', 'failed'),
     ]
-    AUDIO_STORAGE_CHOICES = [
-        ('local', 'local'),
-        ('s3', 's3'),
-        ('inline', 'inline'),
-    ]
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='recordings')
     appointment = models.ForeignKey(Appointment, on_delete=models.CASCADE, related_name='recordings')
     title = models.CharField(max_length=255)
     duration_seconds = models.IntegerField(default=0)
-    audio_storage = models.CharField(max_length=20, choices=AUDIO_STORAGE_CHOICES, default='local')
     audio_object_key = models.CharField(max_length=1024, blank=True, default='')
     audio_content_type = models.CharField(max_length=120, blank=True, default='')
     audio_size_bytes = models.BigIntegerField(default=0)

@@ -48,9 +48,7 @@ urlpatterns = [
     path('recordings', views.recordings_view),
     path('recordings/<int:pk>', views.recording_detail_view),
 
-    # Audio pipeline (direct-to-S3 + transcription)
-    path('audio/uploads', views.audio_upload_init_view),
-    path('audio/objects', views.audio_objects_list_view),
+    # Audio pipeline (local-only recording + transcription)
     # Deprecated: server-side transcription endpoints removed in favor of on-device recognition
     # Clients should use on-device `expo-speech-recognition` and may POST transcripts to
     # `/audio/transcript` to persist transcripts or request server-side extraction.

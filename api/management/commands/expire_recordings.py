@@ -16,11 +16,10 @@ Usage:
 from django.core.management.base import BaseCommand
 
 from api.models import Recording
-from api.s3 import delete_audio_object
 
 
 class Command(BaseCommand):
-    help = "Delete recordings (and their S3 audio) past their dynamic retention window."
+    help = "Delete recordings past their dynamic retention window."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -42,12 +41,6 @@ class Command(BaseCommand):
             if dry_run:
                 self.stdout.write(f"[dry-run] Would delete: {label}")
                 continue
-
-            if recording.audio_storage == 's3' and recording.audio_object_key:
-                try:
-                    delete_audio_object(object_key=recording.audio_object_key)
-                except Exception as exc:  # pragma: no cover - best effort
-                    self.stderr.write(f"Failed to delete S3 object for {label}: {exc}")
 
             recording.delete()
             self.stdout.write(f"Deleted: {label}")

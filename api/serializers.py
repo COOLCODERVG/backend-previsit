@@ -103,7 +103,6 @@ class RecordingSerializer(serializers.ModelSerializer):
             'title',
             'duration_seconds',
             'status',
-            'audio_storage',
             'audio_object_key',
             'audio_content_type',
             'audio_size_bytes',
@@ -127,7 +126,6 @@ class RecordingDetailSerializer(serializers.ModelSerializer):
             'title',
             'duration_seconds',
             'status',
-            'audio_storage',
             'audio_object_key',
             'audio_content_type',
             'audio_size_bytes',
@@ -149,14 +147,6 @@ class RecordingCreateSerializer(serializers.Serializer):
     # Backwards-compatible for local dev: allow base64 uploads, but do not store in DB.
     audio_base64 = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     audio_content_type = serializers.CharField(required=False, allow_null=True, allow_blank=True)
-
-
-class AudioUploadInitSerializer(serializers.Serializer):
-    appointment_id = serializers.IntegerField()
-    title = serializers.CharField(max_length=255)
-    duration_seconds = serializers.IntegerField(default=0)
-    content_type = serializers.CharField(required=False, allow_null=True, allow_blank=True)
-    size_bytes = serializers.IntegerField(required=False, allow_null=True)
 
 
 class PersonalizationProfileSerializer(serializers.ModelSerializer):

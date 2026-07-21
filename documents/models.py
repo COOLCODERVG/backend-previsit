@@ -25,9 +25,6 @@ class ExportedPdf(models.Model):
     )
 
     filename = models.CharField(max_length=255)
-    s3_bucket = models.CharField(max_length=255, blank=True, default="")
-    s3_key = models.CharField(max_length=1024, blank=True, default="")
-    storage = models.CharField(max_length=20, default="local")  # local|s3
 
     sha256 = models.CharField(max_length=64, blank=True, default="")
     size_bytes = models.BigIntegerField(default=0)

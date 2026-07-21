@@ -1,16 +1,15 @@
 """Recording retention / expiry helpers.
 
-Recordings (and their S3 audio copies) are not stored forever. Each user has
-an ``average_appointment_minutes`` setting — collected during onboarding and
-editable from Settings — that estimates how long their visits typically run.
-A recording's retention window is dynamic rather than a fixed timer:
+Recordings are not stored forever. Each user has an ``average_appointment_minutes``
+setting — collected during onboarding and editable from Settings — that estimates
+how long their visits typically run. A recording's retention window is dynamic rather
+than a fixed timer:
 
     retention_minutes = average_appointment_minutes + RETENTION_BUFFER_MINUTES
 
-...counted from the moment the recording was created. Once that window has
-elapsed the recording is considered expired and is purged (S3 object + the
-database row) the next time the owning user's recordings are listed or
-fetched — see ``views._purge_expired_recordings``.
+...counted from the moment the recording was created. Once that window has elapsed
+the recording is considered expired and is purged (the database row) the next time
+the owning user's recordings are listed or fetched — see ``views._purge_expired_recordings``.
 
 This module is intentionally framework-agnostic (plain dataclasses/datetimes,
 no Django ORM imports) so it can be unit tested in isolation, mirroring the

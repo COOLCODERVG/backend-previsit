@@ -41,6 +41,71 @@ def _sample_summary():
     }
 
 
+def _sample_summary_with_voice_entities():
+    """Sample summary that includes extracted_entities from voice recordings."""
+    return {
+        'appointment': {'specialty': 'Rheumatology', 'notes': 'Joint pain follow-up'},
+        'symptoms': [
+            {'name': 'Fatigue', 'severity': 6, 'is_new': False, 'is_worsening': True, 'notes': 'Morning fatigue'},
+        ],
+        'questions': [
+            {'text': 'Medication side effects?', 'is_answered': False, 'priority': 1},
+        ],
+        'notes': [],
+        'feelings': [],
+        'recordings': [
+            {
+                'id': 1,
+                'status': 'extracted',
+                'duration_seconds': 120,
+                'title': 'Voice Dump',
+                'transcript_text': 'I have been experiencing severe joint pain especially in my hands and wrists. Taking ibuprofen 400mg twice daily. Also noticed some swelling.',
+                'extracted_entities': {
+                    'medications': [
+                        {
+                            'name': 'ibuprofen',
+                            'dose': '400mg',
+                            'frequency': 'twice daily',
+                            'route': 'oral',
+                            'rxnorm_code': '5640',
+                            'confidence': 0.92,
+                        }
+                    ],
+                    'symptoms': [
+                        {
+                            'name': 'joint pain',
+                            'severity': 'severe',
+                            'confidence': 0.88,
+                        },
+                        {
+                            'name': 'swelling',
+                            'confidence': 0.85,
+                        }
+                    ],
+                    'conditions': [
+                        {
+                            'name': 'joint pain',
+                            'icd10_code': 'M25.5',
+                            'confidence': 0.87,
+                        }
+                    ],
+                    'instructions': [
+                        {
+                            'text': 'Monitor swelling progression',
+                            'confidence': 0.78,
+                        }
+                    ],
+                }
+            }
+        ],
+        'transcript_snippets': [],
+        'personalization_profile': {
+            'main_reason': 'Manage joint inflammation',
+            'family_history': '',
+        },
+    }
+
+
 def test_assess_llm_input_coverage_warns_on_missing_transcripts():
     coverage = assess_llm_input_coverage(_sample_summary())
     assert coverage['recording_count'] == 2
@@ -59,3 +124,71 @@ def test_build_deidentified_llm_payload_includes_extended_fields():
     assert payload['transcript_excerpt']
     assert payload['recordings']
     assert payload['transcripts']
+    assert payload['transcript_dump']
+    assert 'combined_text' in payload['transcript_dump']
+    assert payload['user_preferences']
+    assert payload['voice_transcript'] == payload['transcript_dump']['combined_text']
+    assert payload['visit_data']['personalization']['main_reason'] == 'Follow-up fatigue'
+
+
+def test_build_deidentified_llm_payload_drops_unsafe_preferences():
+    payload = _build_deidentified_llm_payload(_sample_summary(), {'patient_name': 'Jane Doe', 'layout_style': 'compact'}, user_id=None)
+    assert payload['user_preferences']['layout_style'] == 'compact'
+    assert 'patient_name' not in payload['user_preferences']
+
+
+def test_build_deidentified_llm_payload_with_voice_appointment_fields():
+    """Verify voice extracted_entities are transformed into structured voice_appointment_fields."""
+    payload = _build_deidentified_llm_payload(_sample_summary_with_voice_entities(), user_id=None)
+    
+    # Check that voice_appointment_fields exists at top level
+    assert 'voice_appointment_fields' in payload
+    vaf = payload['voice_appointment_fields']
+    
+    # Verify structure
+    assert vaf['has_structured_data'] is True
+    assert len(vaf['recording_ids']) == 1
+    assert vaf['recording_ids'][0] == 1
+    
+    # Verify medications are extracted and de-identified
+    assert len(vaf['medications']) == 1
+    med = vaf['medications'][0]
+    assert med['name'] == 'ibuprofen'
+    assert med['dose'] == '400mg'
+    assert med['frequency'] == 'twice daily'
+    assert 'confidence' in med
+    assert med['confidence'] == 0.92
+    
+    # Verify symptoms are extracted
+    assert len(vaf['symptoms']) == 2
+    assert vaf['symptoms'][0]['name'] == 'joint pain'
+    assert vaf['symptoms'][0]['severity'] == 'severe'
+    
+    # Verify conditions are extracted
+    assert len(vaf['conditions']) == 1
+    assert vaf['conditions'][0]['name'] == 'joint pain'
+    assert vaf['conditions'][0]['icd10_code'] == 'M25.5'
+    
+    # Verify instructions are extracted
+    assert len(vaf['instructions']) == 1
+    assert 'Monitor' in vaf['instructions'][0]['text']
+    
+    # Verify voice_appointment_fields is also in visit_data
+    assert 'voice_appointment_fields' in payload['visit_data']
+    
+    # Verify signal for LLM that structured data is available
+    assert payload['visit_data']['signals']['has_voice_appointment_fields'] is True
+
+
+def test_build_deidentified_llm_payload_without_voice_entities():
+    """Verify empty voice_appointment_fields when no extracted_entities present."""
+    payload = _build_deidentified_llm_payload(_sample_summary(), user_id=None)
+    
+    # Should still have voice_appointment_fields but with no data
+    assert 'voice_appointment_fields' in payload
+    vaf = payload['voice_appointment_fields']
+    assert vaf['has_structured_data'] is False
+    assert len(vaf['medications']) == 0
+    assert len(vaf['symptoms']) == 0
+    assert len(vaf['conditions']) == 0
+    assert len(vaf['instructions']) == 0

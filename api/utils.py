@@ -110,9 +110,45 @@ def _sanitize_for_llm(text, max_len=280):
     value = re.sub(r'@\w+', '[redacted-handle]', value)
     value = re.sub(r'\b\d{6,}\b', '[redacted-id]', value)
 
-    if len(value) > max_len:
+    if max_len is not None and len(value) > max_len:
         value = value[:max_len].rstrip() + '...'
     return value
+
+
+def _build_llm_transcript_dump(summary_payload):
+    recordings = []
+    combined_text = []
+
+    for rec in summary_payload.get('recordings') or []:
+        tx = (rec.get('transcript_text') or '').strip()
+        if not tx:
+            continue
+
+        sanitized = _sanitize_for_llm(tx, None)
+        recordings.append({
+            'recording_id': rec.get('id'),
+            'status': rec.get('status') or '',
+            'duration_seconds': rec.get('duration_seconds'),
+            'title': _sanitize_for_llm(rec.get('title'), 80),
+            'transcript_text': sanitized,
+        })
+        combined_text.append(sanitized)
+
+    return {
+        'recordings': recordings,
+        'combined_text': ' '.join(combined_text),
+    }
+
+
+def _build_llm_user_preferences(export_preferences):
+    safe_preferences = export_preferences or {}
+    return {
+        'layout_style': safe_preferences.get('layout_style', 'detailed'),
+        'font_size': safe_preferences.get('font_size', 'normal'),
+        'date_format': safe_preferences.get('date_format', 'long'),
+        'include_personalization': bool(safe_preferences.get('include_personalization', True)),
+        'include_sections': safe_preferences.get('include_sections') or {},
+    }
 
 
 def _build_llm_transcript_bundle(summary_payload):
@@ -166,6 +202,87 @@ def _build_recording_llm_metadata(summary_payload):
             'provider_instruction_hints': instructions,
         })
     return rows[:15]
+
+
+def _build_voice_appointment_fields(summary_payload):
+    """Extract structured appointment fields from voice dump recordings.
+    
+    Returns a dict with extracted entities from voice transcripts:
+    {
+        'medications': [...],
+        'symptoms': [...],
+        'conditions': [...],
+        'instructions': [...],
+        'recording_ids': [...]
+    }
+    
+    This represents the voice dump as structured appointment data rather than
+    unstructured notes, ensuring the LLM treats voice input as clinical facts.
+    """
+    medications = []
+    symptoms = []
+    conditions = []
+    instructions = []
+    recording_ids = []
+    
+    for rec in summary_payload.get('recordings') or []:
+        entities = rec.get('extracted_entities') if isinstance(rec.get('extracted_entities'), dict) else {}
+        if not entities:
+            continue
+            
+        recording_ids.append(rec.get('id'))
+        
+        # Extract medications (already structured by clinical_extraction.py)
+        for med in entities.get('medications') or []:
+            if not isinstance(med, dict):
+                continue
+            medications.append({
+                'name': _sanitize_for_llm(med.get('name'), 80),
+                'dose': _sanitize_for_llm(med.get('dose'), 60),
+                'frequency': _sanitize_for_llm(med.get('frequency'), 60),
+                'route': _sanitize_for_llm(med.get('route'), 40),
+                'rxnorm_code': med.get('rxnorm_code', ''),
+                'confidence': float(med.get('confidence') or 0.0),
+            })
+        
+        # Extract symptoms
+        for sym in entities.get('symptoms') or []:
+            if not isinstance(sym, dict):
+                continue
+            symptoms.append({
+                'name': _sanitize_for_llm(sym.get('name'), 80),
+                'severity': _sanitize_for_llm(sym.get('severity'), 20),
+                'confidence': float(sym.get('confidence') or 0.0),
+            })
+        
+        # Extract conditions
+        for cond in entities.get('conditions') or []:
+            if not isinstance(cond, dict):
+                continue
+            conditions.append({
+                'name': _sanitize_for_llm(cond.get('name'), 80),
+                'icd10_code': cond.get('icd10_code', ''),
+                'confidence': float(cond.get('confidence') or 0.0),
+            })
+        
+        # Extract instructions/procedures
+        for instr in entities.get('instructions') or []:
+            if not isinstance(instr, dict):
+                continue
+            instructions.append({
+                'text': _sanitize_for_llm(instr.get('text'), 160),
+                'confidence': float(instr.get('confidence') or 0.0),
+            })
+    
+    # Cap results
+    return {
+        'medications': medications[:_LLM_MAX_MEDICATIONS],
+        'symptoms': symptoms[:_LLM_MAX_SYMPTOMS],
+        'conditions': conditions[:10],
+        'instructions': instructions[:10],
+        'recording_ids': recording_ids,
+        'has_structured_data': bool(recording_ids),
+    }
 
 
 def _fetch_active_medications_for_llm(user_id):
@@ -244,12 +361,14 @@ def _build_deidentified_llm_payload(summary_payload, export_preferences=None, us
         avg_energy = round(sum((f.get('energy_level') or 0) for f in feelings) / len(feelings), 1)
 
     transcript_rows, transcript_combined = _build_llm_transcript_bundle(summary_payload)
+    transcript_dump = _build_llm_transcript_dump(summary_payload)
+    voice_appointment_fields = _build_voice_appointment_fields(summary_payload)
     family_history = _sanitize_for_llm(
         (personalization.get('family_history') if personalization else None) or '',
         500,
     )
 
-    deidentified = {
+    visit_data = {
         'context': {
             # Explicitly no patient name/email/id, no doctor name, no location.
             'appointment_specialty': _sanitize_for_llm(appointment.get('specialty'), 80),
@@ -283,6 +402,7 @@ def _build_deidentified_llm_payload(summary_payload, export_preferences=None, us
             'avg_energy_level': avg_energy,
             'recording_count': len(summary_payload.get('recordings') or []),
             'recordings_with_transcript': len(transcript_rows),
+            'has_voice_appointment_fields': voice_appointment_fields.get('has_structured_data', False),
         },
         'symptoms': symptom_items(),
         'top_symptoms': symptom_items(),
@@ -308,14 +428,20 @@ def _build_deidentified_llm_payload(summary_payload, export_preferences=None, us
         'medications': _fetch_active_medications_for_llm(user_id),
         'recordings': _build_recording_llm_metadata(summary_payload),
         'transcripts': transcript_rows,
-        'export_preferences': {
-            'layout_style': preferences.get('layout_style', 'detailed'),
-            'font_size': preferences.get('font_size', 'normal'),
-            'date_format': preferences.get('date_format', 'long'),
-        },
+        'transcript_dump': transcript_dump,
+        'voice_appointment_fields': voice_appointment_fields,
     }
     if transcript_combined:
-        deidentified['transcript_excerpt'] = transcript_combined
+        visit_data['transcript_excerpt'] = transcript_combined
+
+    deidentified = {
+        'user_preferences': _build_llm_user_preferences(preferences),
+        'visit_data': visit_data,
+        'voice_transcript': transcript_dump['combined_text'],
+        'transcript_dump': transcript_dump,
+        'voice_appointment_fields': voice_appointment_fields,
+        **visit_data,
+    }
     return deidentified
 
 
@@ -614,7 +740,7 @@ def build_custom_summary_pdf(summary_payload, export_preferences=None, ai_guidan
         pdf.line(margin_x, 40, margin_x + content_width, 40)
         pdf.drawString(margin_x, 28, 'Generated by SyniVia · Not medical advice · SyniVia not liable for errors/omissions')
         if ai_guidance:
-            pdf.drawString(margin_x, 18, 'Personalized using OpenAI with de-identified inputs')
+            pdf.drawString(margin_x, 18, 'Personalized using SyniVia with de-identified inputs')
 
     draw_title('SYNIVIA SUMMARY PDF')
     draw_subtitle(f"Doctor: {appointment.get('doctor_name') or '—'}")

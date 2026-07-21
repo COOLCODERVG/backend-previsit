@@ -37,6 +37,8 @@ from . import ml_bridge
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_LLM_INFERENCE_URL = "http://127.0.0.1:11434"
+
 
 # --------------------------------------------------------------------------- #
 # Config                                                                      #
@@ -47,7 +49,7 @@ def _embedding_url() -> str:
 
 
 def _llm_url() -> str:
-    return (os.environ.get("LLM_INFERENCE_URL") or "").strip().rstrip("/")
+    return (os.environ.get("LLM_INFERENCE_URL") or DEFAULT_LLM_INFERENCE_URL).strip().rstrip("/")
 
 
 DEFAULT_LAYER = int(os.environ.get("LLM_DEFAULT_EXTRACT_LAYER", "12"))

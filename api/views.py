@@ -842,8 +842,8 @@ def audio_extract_entities_view(request, pk):
     Pipeline:
       1. Pull `Recording.transcript_text` (must already exist; the
          transcription endpoint produces it).
-      2. Run `clinical_extraction.extract_from_transcript`, which calls
-         AWS Comprehend Medical (DetectEntitiesV2 + InferRxNorm + InferICD10CM).
+      2. Run `clinical_extraction.extract_from_transcript`, which calls the
+         local LLM service via `LLM_INFERENCE_URL` and `LLM_MODEL_ID`.
       3. Store the structured output on `Recording.extracted_entities`.
       4. Reconcile detected medications into the user's `Medication` table
          (high-confidence rows auto-confirmed, others queued for review).
@@ -851,9 +851,9 @@ def audio_extract_entities_view(request, pk):
          derivation worker so the LLM is immediately biased toward the new
          clinical state.
 
-    The caller may POST a body with ``override_payload`` to bypass Comprehend
-    Medical (useful in tests or when an external worker has already extracted
-    the entities).
+    The caller may POST a body with ``override_payload`` to bypass the LLM-based
+    transcript extractor (useful in tests or when an external worker has already
+    extracted the entities).
     """
     try:
         recording = Recording.objects.get(pk=pk, user=request.user)
@@ -893,7 +893,7 @@ def audio_extract_entities_view(request, pk):
         try:
             result = extract_from_transcript(recording.transcript_text or '')
         except Exception as exc:
-            logger.exception("Comprehend Medical extraction failed: %s", exc)
+            logger.exception("Transcript extraction failed: %s", exc)
             return Response({'detail': 'Clinical extraction failed', 'error': str(exc)}, status=502)
         payload = result.to_payload()
         medications_for_reconcile = result.medications

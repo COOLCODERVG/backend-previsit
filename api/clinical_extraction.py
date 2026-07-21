@@ -1,19 +1,8 @@
 """Voice-transcript → structured-clinical-data pipeline.
 
-Wraps **AWS Comprehend Medical** (HIPAA-eligible). Three calls:
-
-* ``DetectEntitiesV2`` — produces medical NER + relation extraction in one
-  go. We use it for symptoms, conditions, anatomy, and provider instructions.
-* ``InferRxNorm`` — normalizes medication mentions to RxNorm CUIs, with the
-  candidate list ranked by score.
-* ``InferICD10CM`` — normalizes condition mentions to ICD-10-CM codes.
-
-Confidence thresholds determine whether a downstream record is auto-confirmed
-or queued for user review (``MedicationReconciliationService``).
-
-The transcript text is processed in 20k-char chunks because Comprehend Medical
-rejects requests above its limit; for typical 30-minute appointments a single
-call is plenty.
+Uses the backend LLM service configured by LLM_INFERENCE_URL and LLM_MODEL_ID.
+Structured entity extraction is performed by the local Ollama/LLM inference
+service instead of external medical NLP APIs.
 """
 
 from __future__ import annotations
@@ -23,19 +12,11 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .llm_client import call_llama_transcript_extraction
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MED_AUTO_THRESHOLD = float(os.environ.get("CM_AUTO_CONFIRM_THRESHOLD", "0.85"))
-COMPREHEND_MAX_BYTES = 20000
-
-
-def _client():
-    import boto3
-
-    return boto3.client(
-        "comprehendmedical",
-        region_name=(os.environ.get("AWS_REGION") or "us-east-1").strip(),
-    )
 
 
 @dataclass
@@ -99,142 +80,79 @@ class ExtractionResult:
         }
 
 
-def _chunk_text(text: str, max_bytes: int = COMPREHEND_MAX_BYTES) -> List[str]:
-    if not text:
-        return []
-    encoded = text.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return [text]
-    chunks: List[str] = []
-    start = 0
-    while start < len(encoded):
-        end = min(start + max_bytes, len(encoded))
-        # Decode safely on a UTF-8 boundary.
-        slice_bytes = encoded[start:end]
-        while end > start and slice_bytes:
-            try:
-                chunks.append(slice_bytes.decode("utf-8"))
-                break
-            except UnicodeDecodeError:
-                end -= 1
-                slice_bytes = encoded[start:end]
-        start = end
-    return chunks
-
-
-def _attribute(entity: Dict[str, Any], typ: str) -> str:
-    """Pull a typed attribute (e.g. DOSAGE, ROUTE_OR_MODE) off a Comprehend entity."""
-    for attr in entity.get("Attributes") or []:
-        if (attr.get("Type") or "").upper() == typ:
-            return (attr.get("Text") or "").strip()
-    return ""
-
-
 def extract_from_transcript(transcript_text: str) -> ExtractionResult:
     """Run the full extraction pipeline on a single transcript."""
     text = (transcript_text or "").strip()
     if not text:
         return ExtractionResult()
 
+    result = ExtractionResult()
     try:
-        client = _client()
+        extracted = call_llama_transcript_extraction(
+            transcript=text,
+            steering_vectors=[],
+            timeout_seconds=45,
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Comprehend Medical client unavailable: %s", exc)
+        logger.exception("Transcript extraction failed: %s", exc)
         return ExtractionResult(raw={"error": str(exc)})
 
-    result = ExtractionResult()
-    raw_pages: List[Dict[str, Any]] = []
+    if not extracted or not isinstance(extracted, dict):
+        return ExtractionResult(raw={"error": "LLM transcript extraction returned invalid data", "payload": extracted})
 
-    for chunk in _chunk_text(text):
-        try:
-            entities = client.detect_entities_v2(Text=chunk).get("Entities") or []
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("DetectEntitiesV2 failed: %s", exc)
-            entities = []
+    result.raw = {"llm_output": extracted}
 
-        try:
-            rx = client.infer_rx_norm(Text=chunk).get("Entities") or []
-        except Exception as exc:  # noqa: BLE001
-            logger.info("InferRxNorm failed: %s", exc)
-            rx = []
-
-        try:
-            icd = client.infer_icd10_cm(Text=chunk).get("Entities") or []
-        except Exception as exc:  # noqa: BLE001
-            logger.info("InferICD10CM failed: %s", exc)
-            icd = []
-
-        raw_pages.append({"entities": entities, "rxnorm": rx, "icd10": icd})
-
-        for ent in rx:
-            concepts = ent.get("RxNormConcepts") or []
-            top = concepts[0] if concepts else {}
-            result.medications.append(
-                MedicationCandidate(
-                    name=(ent.get("Text") or "").strip(),
-                    rxnorm_code=(top.get("Code") or "").strip(),
-                    rxnorm_description=(top.get("Description") or "").strip(),
-                    dose=_attribute(ent, "DOSAGE"),
-                    frequency=_attribute(ent, "FREQUENCY"),
-                    route=_attribute(ent, "ROUTE_OR_MODE"),
-                    duration=_attribute(ent, "DURATION"),
-                    confidence=float(ent.get("Score") or 0.0),
-                    text_span=(ent.get("Text") or "").strip(),
-                    raw=ent,
-                )
+    for med in extracted.get("medications") or []:
+        if not isinstance(med, dict):
+            continue
+        result.medications.append(
+            MedicationCandidate(
+                name=str(med.get("name") or "").strip(),
+                dose=str(med.get("dose") or "").strip(),
+                frequency=str(med.get("frequency") or "").strip(),
+                route=str(med.get("route") or "").strip(),
+                rxnorm_code=str(med.get("rxnorm_code") or "").strip(),
+                rxnorm_description=str(med.get("rxnorm_description") or "").strip(),
+                confidence=float(med.get("confidence") or 0.0),
+                text_span=str(med.get("text_span") or med.get("name") or "").strip(),
+                raw=med,
             )
+        )
 
-        for ent in icd:
-            concepts = ent.get("ICD10CMConcepts") or []
-            top = concepts[0] if concepts else {}
-            result.conditions.append(
-                ConditionCandidate(
-                    name=(ent.get("Text") or "").strip(),
-                    icd10_code=(top.get("Code") or "").strip(),
-                    icd10_description=(top.get("Description") or "").strip(),
-                    confidence=float(ent.get("Score") or 0.0),
-                    text_span=(ent.get("Text") or "").strip(),
-                )
+    for sym in extracted.get("symptoms") or []:
+        if not isinstance(sym, dict):
+            continue
+        result.symptoms.append(
+            SymptomCandidate(
+                name=str(sym.get("name") or "").strip(),
+                severity=str(sym.get("severity") or "").strip(),
+                confidence=float(sym.get("confidence") or 0.0),
+                text_span=str(sym.get("text_span") or sym.get("name") or "").strip(),
             )
+        )
 
-        for ent in entities:
-            category = (ent.get("Category") or "").upper()
-            etype = (ent.get("Type") or "").upper()
-            text_span = (ent.get("Text") or "").strip()
-            score = float(ent.get("Score") or 0.0)
+    for cond in extracted.get("conditions") or []:
+        if not isinstance(cond, dict):
+            continue
+        result.conditions.append(
+            ConditionCandidate(
+                name=str(cond.get("name") or "").strip(),
+                icd10_code=str(cond.get("icd10_code") or "").strip(),
+                confidence=float(cond.get("confidence") or 0.0),
+                text_span=str(cond.get("text_span") or cond.get("name") or "").strip(),
+            )
+        )
 
-            if category == "MEDICAL_CONDITION":
-                # Already covered by ICD10 path with normalization; only add
-                # un-coded ones here so we don't double-count.
-                if not any(c.text_span == text_span for c in result.conditions):
-                    result.conditions.append(
-                        ConditionCandidate(name=text_span, confidence=score, text_span=text_span)
-                    )
+    for instr in extracted.get("instructions") or []:
+        if not isinstance(instr, dict):
+            continue
+        result.instructions.append(
+            InstructionCandidate(
+                text=str(instr.get("text") or "").strip(),
+                confidence=float(instr.get("confidence") or 0.0),
+            )
+        )
 
-            if etype in {"SIGN", "SYMPTOM"} or category == "MEDICAL_CONDITION":
-                # Many providers record symptoms as conditions; for the user
-                # we surface them as symptoms when not coded.
-                if etype in {"SIGN", "SYMPTOM"}:
-                    result.symptoms.append(
-                        SymptomCandidate(
-                            name=text_span,
-                            severity=_attribute(ent, "QUALITY"),
-                            confidence=score,
-                            text_span=text_span,
-                        )
-                    )
-
-            if category == "PROTECTED_HEALTH_INFORMATION":
-                # Don't pass PHI mentions back as "instructions"; they should
-                # never appear in downstream summaries.
-                continue
-
-            if etype in {"INSTRUCTION", "TREATMENT"} or category == "TEST_TREATMENT_PROCEDURE":
-                result.instructions.append(
-                    InstructionCandidate(text=text_span, confidence=score)
-                )
-
-    result.raw = {"chunks": raw_pages}
     return result
 
 

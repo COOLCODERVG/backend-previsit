@@ -5,9 +5,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-import boto3
 import requests
-from botocore.config import Config as BotoConfig
 
 # Default matches NeuraVia spec (host should pin exact revision in inference image).
 DEFAULT_LLM_MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
@@ -38,6 +36,50 @@ PDF_GUIDANCE_RESPONSE_FORMAT: Dict[str, Any] = {
     },
 }
 
+VOICE_TRANSCRIPT_EXTRACTION_RESPONSE_FORMAT: Dict[str, Any] = {
+    "type": "json",
+    "schema": {
+        "medications": [
+            {
+                "name": "string",
+                "dose": "string",
+                "frequency": "string",
+                "route": "string",
+                "rxnorm_code": "string",
+                "confidence": "number",
+                "text_span": "string",
+            }
+        ],
+        "symptoms": [
+            {
+                "name": "string",
+                "severity": "string",
+                "confidence": "number",
+                "text_span": "string",
+            }
+        ],
+        "conditions": [
+            {
+                "name": "string",
+                "icd10_code": "string",
+                "confidence": "number",
+                "text_span": "string",
+            }
+        ],
+        "instructions": [
+            {
+                "text": "string",
+                "confidence": "number",
+            }
+        ],
+        "notes": "string",
+        "codes": {
+            "rxnorm": ["string"],
+            "icd10": ["string"],
+        },
+    },
+}
+
 
 def _inference_url() -> str:
     return (os.environ.get("LLM_INFERENCE_URL") or DEFAULT_LLM_INFERENCE_URL).strip().rstrip("/")
@@ -45,21 +87,6 @@ def _inference_url() -> str:
 
 def _model_id() -> str:
     return (os.environ.get("LLM_MODEL_ID") or DEFAULT_LLM_MODEL_ID).strip()
-
-
-def _sagemaker_endpoint() -> str:
-    """Name of the AWS SageMaker Serverless Inference endpoint, if configured.
-
-    When set, `call_llama_inference` sends requests here via `boto3`
-    (`sagemaker-runtime.invoke_endpoint`) instead of the plain HTTP inference
-    service. Leave unset to keep using `LLM_INFERENCE_URL` for local
-    development / a self-hosted `services/llm` instance.
-    """
-    return os.environ.get("SAGEMAKER_ENDPOINT", "").strip()
-
-
-def _aws_region() -> Optional[str]:
-    return (os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "").strip() or None
 
 
 def build_inference_request(
@@ -100,34 +127,11 @@ def build_inference_request(
     return body
 
 
-def _invoke_via_sagemaker(*, endpoint_name: str, body: Dict[str, Any], timeout_seconds: int) -> Dict[str, Any]:
-    """Transport: AWS SageMaker Serverless Inference via boto3.
-
-    Sends the exact same JSON contract produced by `build_inference_request`
-    as the request body to `sagemaker-runtime.invoke_endpoint`. The endpoint's
-    container is expected to implement the same request/response contract as
-    the HTTP inference service's `/v1/generate` (SageMaker routes this to the
-    container's `/invocations` handler internally) so no prompt, generation,
-    or parsing logic needs to differ between transports.
-    """
-    config = BotoConfig(connect_timeout=10, read_timeout=timeout_seconds)
-    client = boto3.client("sagemaker-runtime", region_name=_aws_region(), config=config)
-    payload = json.dumps(body).encode("utf-8")
-    response = client.invoke_endpoint(
-        EndpointName=endpoint_name,
-        ContentType="application/json",
-        Accept="application/json",
-        Body=payload,
-    )
-    raw_body = response["Body"].read()
-    return json.loads(raw_body.decode("utf-8"))
-
-
 def _invoke_via_http(*, url: str, body: Dict[str, Any], timeout_seconds: int) -> Dict[str, Any]:
-    """Transport: the existing self-hosted HTTP inference service (`services/llm`).
+    """Transport: the self-hosted HTTP inference service (`services/llm`).
 
-    Kept as the fallback for local development/testing when SAGEMAKER_ENDPOINT
-    isn't configured -- byte-for-byte the same request this function always made.
+    Sends the same JSON contract produced by `build_inference_request` to
+    the local LLM inference service at `/v1/generate`.
     """
     resp = requests.post(f"{url}/v1/generate", json=body, timeout=timeout_seconds)
     resp.raise_for_status()
@@ -143,10 +147,9 @@ def call_llama_inference(
     response_format: Optional[Dict[str, Any]] = None,
     timeout_seconds: int = 30,
 ) -> Optional[Dict[str, Any]]:
-    endpoint_name = _sagemaker_endpoint()
     url = _inference_url()
-    if not endpoint_name and not url:
-        logger.warning("LLM inference skipped: neither SAGEMAKER_ENDPOINT nor LLM_INFERENCE_URL is configured")
+    if not url:
+        logger.warning("LLM inference skipped: LLM_INFERENCE_URL is not configured")
         return None
 
     body = build_inference_request(
@@ -156,7 +159,6 @@ def call_llama_inference(
         generation=generation,
         response_format=response_format,
     )
-    transport = "sagemaker" if endpoint_name else "http"
     try:
         logger.info(
             "llm_inference request task=%s model=%s steering_vectors=%s response_format=%s transport=%s",
@@ -164,18 +166,15 @@ def call_llama_inference(
             body.get("model"),
             len(steering_vectors or []),
             bool(response_format),
-            transport,
+            "http",
         )
-        if endpoint_name:
-            data = _invoke_via_sagemaker(endpoint_name=endpoint_name, body=body, timeout_seconds=timeout_seconds)
-        else:
-            data = _invoke_via_http(url=url, body=body, timeout_seconds=timeout_seconds)
+        data = _invoke_via_http(url=url, body=body, timeout=timeout_seconds)
     except Exception:
         logger.exception(
             "llm_inference request failed task=%s transport=%s target=%s",
             task,
-            transport,
-            endpoint_name or url,
+            "http",
+            url,
         )
         return None
 
@@ -231,5 +230,21 @@ def call_llama_pdf_guidance(
         steering_vectors=steering_vectors,
         generation={"temperature": 0.3, "max_tokens": 700},
         response_format=PDF_GUIDANCE_RESPONSE_FORMAT,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def call_llama_transcript_extraction(
+    *,
+    transcript: str,
+    steering_vectors: List[Dict[str, Any]],
+    timeout_seconds: int = 45,
+) -> Optional[Dict[str, Any]]:
+    return call_llama_inference(
+        task="voice_transcript_extraction",
+        input_payload={"transcript": transcript},
+        steering_vectors=steering_vectors,
+        generation={"temperature": 0.2, "max_tokens": 900},
+        response_format=VOICE_TRANSCRIPT_EXTRACTION_RESPONSE_FORMAT,
         timeout_seconds=timeout_seconds,
     )

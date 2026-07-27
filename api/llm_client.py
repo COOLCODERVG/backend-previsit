@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -127,15 +128,108 @@ def build_inference_request(
     return body
 
 
-def _invoke_via_http(*, url: str, body: Dict[str, Any], timeout_seconds: int) -> Dict[str, Any]:
-    """Transport: the self-hosted HTTP inference service (`services/llm`).
-
-    Sends the same JSON contract produced by `build_inference_request` to
-    the local LLM inference service at `/v1/generate`.
+def _serialize_prompt_for_ollama(body: Dict[str, Any]) -> str:
+    """Convert the existing structured `build_inference_request()` body into a
+    single text prompt that a plain-text completion API (Ollama `/api/generate`)
+    can consume, while preserving the same task/input/steering/schema contract.
     """
-    resp = requests.post(f"{url}/v1/generate", json=body, timeout=timeout_seconds)
+    task = body.get("task") or "general"
+    input_payload = body.get("input") or {}
+    steering_vectors = body.get("steering") or []
+    response_format = body.get("response_format")
+
+    lines: List[str] = [
+        "You are the SyniVia clinical visit-prep assistant.",
+        f"Task: {task}",
+    ]
+
+    if steering_vectors:
+        lines.append(
+            f"(Personalization context: {len(steering_vectors)} steering vector(s) "
+            "supplied by the upstream personalization system; reflect their guidance "
+            "implicitly in tone and emphasis.)"
+        )
+
+    lines.append("Input data (JSON):")
+    try:
+        lines.append(json.dumps(input_payload, ensure_ascii=False, default=str))
+    except Exception:
+        lines.append(str(input_payload))
+
+    if isinstance(response_format, dict) and response_format.get("schema"):
+        schema = response_format["schema"]
+        lines.append(
+            "Respond with ONLY a single valid JSON object — no markdown, no code "
+            "fences, no commentary before or after — matching exactly this schema "
+            f"(keys and value types): {json.dumps(schema, ensure_ascii=False)}"
+        )
+    else:
+        lines.append("Respond with a concise, helpful answer.")
+
+    return "\n\n".join(lines)
+
+
+def _parse_llm_json_output(text: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Best-effort parse of a model's raw text response into a JSON dict.
+
+    Handles: plain JSON, JSON wrapped in ```json ... ``` code fences, and JSON
+    embedded within surrounding prose (extracts the first balanced {...} block).
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+
+    cleaned = text.strip()
+
+    fence_match = re.match(r"^```[a-zA-Z]*\s*\n?(.*)```\s*$", cleaned, re.DOTALL)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+
+    try:
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = cleaned[start : end + 1]
+        try:
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            pass
+
+    return None
+
+
+def _invoke_via_http(*, url: str, body: Dict[str, Any], timeout_seconds: int) -> Dict[str, Any]:
+    """Transport: local Ollama server running the `synivia-model` model.
+
+    Ollama exposes a plain-text completion API at `POST /api/generate`
+    (`{"model", "prompt", "stream": false}` -> `{"response": "..."}`), which is
+    different from the original custom `/v1/generate` JSON-in/JSON-out contract
+    `build_inference_request()` was designed for. We preserve
+    `build_inference_request()`'s structured body unchanged and simply
+    serialize it into a single prompt here, then parse Ollama's text response
+    back into a dict so the rest of the pipeline (schema-shaped dicts) is
+    unaffected.
+    """
+    prompt = _serialize_prompt_for_ollama(body)
+    ollama_payload = {
+        "model": body.get("model") or _model_id(),
+        "prompt": prompt,
+        "stream": False,
+    }
+
+    resp = requests.post(f"{url}/api/generate", json=ollama_payload, timeout=timeout_seconds)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+
+    raw_text = data.get("response") if isinstance(data, dict) else None
+    parsed = _parse_llm_json_output(raw_text)
+
+    return {"output": parsed if parsed is not None else raw_text}
 
 
 def call_llama_inference(
@@ -161,20 +255,47 @@ def call_llama_inference(
     )
     try:
         logger.info(
-            "llm_inference request task=%s model=%s steering_vectors=%s response_format=%s transport=%s",
+            "llm_inference request task=%s model=%s steering_vectors=%s response_format=%s transport=%s endpoint=%s",
             task,
             body.get("model"),
             len(steering_vectors or []),
             bool(response_format),
             "http",
+            f"{url}/api/generate",
         )
-        data = _invoke_via_http(url=url, body=body, timeout=timeout_seconds)
-    except Exception:
-        logger.exception(
-            "llm_inference request failed task=%s transport=%s target=%s",
+        data = _invoke_via_http(url=url, body=body, timeout_seconds=timeout_seconds)
+    except requests.exceptions.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        response_text = None
+        if exc.response is not None:
+            try:
+                response_text = exc.response.text[:2000]
+            except Exception:
+                response_text = None
+        logger.error(
+            "llm_inference request failed task=%s transport=%s endpoint=%s status_code=%s response_text=%s",
             task,
             "http",
-            url,
+            f"{url}/api/generate",
+            status_code,
+            response_text,
+        )
+        return None
+    except requests.exceptions.RequestException as exc:
+        logger.error(
+            "llm_inference request failed task=%s transport=%s endpoint=%s error=%s",
+            task,
+            "http",
+            f"{url}/api/generate",
+            str(exc),
+        )
+        return None
+    except Exception:
+        logger.exception(
+            "llm_inference request failed unexpectedly task=%s transport=%s endpoint=%s",
+            task,
+            "http",
+            f"{url}/api/generate",
         )
         return None
 

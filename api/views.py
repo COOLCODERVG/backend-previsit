@@ -12,6 +12,7 @@ import json
 import logging
 import urllib.request
 import requests
+from django.db import connection
 
 from .models import User, Appointment, Symptom, Feeling, Question, Note, Recording, PersonalizationProfile
 from .serializers import (
@@ -365,7 +366,10 @@ def root_view(request):
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def health_view(request):
-    return Response({'status': 'healthy', 'database': 'sqlite3'})
+    return Response({
+	    'status': 'healthy',
+	    'database': connection.vendor
+	})
 
 
 # ============== Appointment Views ==============

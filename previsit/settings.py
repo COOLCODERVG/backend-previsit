@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 from datetime import timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / '.env')
@@ -91,8 +91,8 @@ def _database_from_url(url: str):
     return {
         'ENGINE': 'django.db.backends.postgresql',
         'NAME': (parsed.path or '').lstrip('/'),
-        'USER': parsed.username or '',
-        'PASSWORD': parsed.password or '',
+        'USER': unquote(parsed.username or ''),
+        'PASSWORD': unquote(parsed.password or ''),
         'HOST': parsed.hostname or '',
         'PORT': str(parsed.port or ''),
         'CONN_MAX_AGE': int(os.environ.get('DB_CONN_MAX_AGE', '60')),

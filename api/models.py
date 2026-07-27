@@ -186,6 +186,36 @@ class Recording(models.Model):
     transcript_text = models.TextField(blank=True, default='')
     transcript_json = models.JSONField(blank=True, default=dict)
     extracted_entities = models.JSONField(blank=True, default=dict)
+    # Structured, LLM-generated post-visit summary (see clinical_extraction.
+    # generate_visit_summary()). Flexible/tolerant schema — any field may be
+    # missing or empty if the model didn't mention it; the frontend renders
+    # each section conditionally. Typical shape:
+    #   {
+    #     "summary": str,
+    #     "action_items": [{"text": str, "completed": bool}],
+    #     "medication_changes": [{"name","dosage","frequency","duration"}],
+    #     "tests_ordered": [str],
+    #     "follow_ups": [str],
+    #     "upcoming_appointments": [str],
+    #     "doctor_instructions": [str],
+    #     "lifestyle_recommendations": [str],
+    #     "warnings": [str],
+    #     "questions_for_next_visit": [str],
+    #   }
+    visit_summary = models.JSONField(blank=True, default=dict)
+    VISIT_SUMMARY_STATUS_CHOICES = [
+        ('pending', 'pending'),
+        ('processing', 'processing'),
+        ('completed', 'completed'),
+        ('failed', 'failed'),
+    ]
+    visit_summary_status = models.CharField(
+        max_length=20,
+        choices=VISIT_SUMMARY_STATUS_CHOICES,
+        default='pending',
+        help_text='pending|processing|completed|failed',
+    )
+    visit_summary_error = models.CharField(max_length=500, blank=True, default='')
     # Backwards-compatible local/dev fallback for inline upload payloads.
     audio_base64 = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)

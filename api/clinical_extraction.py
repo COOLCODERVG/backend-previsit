@@ -12,7 +12,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .llm_client import call_llama_transcript_extraction
+from .llm_client import call_llama_transcript_extraction, call_llama_visit_summary
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +157,203 @@ def extract_from_transcript(transcript_text: str) -> ExtractionResult:
 
 
 # --------------------------------------------------------------------------- #
-# Medication reconciliation                                                   #
+# Post-visit AI summary (patient-facing follow-up brief)                      #
+# --------------------------------------------------------------------------- #
+
+def _coerce_str_list(value: Any) -> List[str]:
+    """Best-effort normalization of an LLM field that should be a list of
+    strings, but might come back as a single string, a list of dicts, or
+    missing entirely. Never raises."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, list):
+        out: List[str] = []
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    out.append(text)
+            elif isinstance(item, dict):
+                # Some models wrap list items as {"text": "..."} objects.
+                text = str(item.get("text") or item.get("description") or item.get("name") or "").strip()
+                if text:
+                    out.append(text)
+        return out
+    return []
+
+
+def _coerce_action_items(value: Any) -> List[Dict[str, Any]]:
+    """Normalize action items into [{"text": str, "completed": bool}, ...],
+    tolerant of the LLM returning plain strings or partially-shaped dicts."""
+    items = []
+    for text in _coerce_str_list(value):
+        items.append({"text": text, "completed": False})
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict) and item.get("completed") is not None:
+                text = str(item.get("text") or "").strip()
+                for existing in items:
+                    if existing["text"] == text:
+                        existing["completed"] = bool(item.get("completed"))
+    return items
+
+
+def _coerce_medication_changes(value: Any) -> List[Dict[str, str]]:
+    """Normalize medication-change entries into a flexible schema — any of
+    name/dosage/frequency/duration/change_type may be missing."""
+    if not isinstance(value, list):
+        return []
+    out: List[Dict[str, str]] = []
+    for item in value:
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            out.append({
+                "name": name,
+                "dosage": str(item.get("dosage") or item.get("dose") or "").strip(),
+                "frequency": str(item.get("frequency") or "").strip(),
+                "duration": str(item.get("duration") or "").strip(),
+                "change_type": str(item.get("change_type") or "").strip(),
+            })
+        elif isinstance(item, str) and item.strip():
+            out.append({"name": item.strip(), "dosage": "", "frequency": "", "duration": "", "change_type": ""})
+    return out
+
+
+def generate_visit_summary(transcript_text: str) -> Dict[str, Any]:
+    """Generate a structured, patient-facing post-visit summary from a raw
+    visit transcript using the same Ollama/SyniVia LLM pipeline used
+    elsewhere in the app.
+
+    The returned schema is intentionally flexible/tolerant: any section may
+    be an empty list/string if the model didn't mention it, or if the LLM
+    call failed outright (in which case ``_meta.error`` is populated instead
+    of raising, so callers can persist a "failed" status without crashing
+    the recording pipeline).
+    """
+    empty: Dict[str, Any] = {
+        "summary": "",
+        "action_items": [],
+        "medication_changes": [],
+        "tests_ordered": [],
+        "follow_ups": [],
+        "upcoming_appointments": [],
+        "doctor_instructions": [],
+        "lifestyle_recommendations": [],
+        "warnings": [],
+        "questions_for_next_visit": [],
+    }
+
+    text = (transcript_text or "").strip()
+    if not text:
+        return {**empty, "_meta": {"error": "empty_transcript"}}
+
+    try:
+        raw = call_llama_visit_summary(transcript=text)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("call_llama_visit_summary failed: %s", exc)
+        return {**empty, "_meta": {"error": str(exc)}}
+
+    if not isinstance(raw, dict) or not str(raw.get("summary") or "").strip():
+        return {**empty, "_meta": {"error": "llm_returned_no_usable_summary"}}
+
+    return {
+        "summary": str(raw.get("summary") or "").strip(),
+        "action_items": _coerce_action_items(raw.get("action_items")),
+        "medication_changes": _coerce_medication_changes(raw.get("medication_changes")),
+        "tests_ordered": _coerce_str_list(raw.get("tests_ordered")),
+        "follow_ups": _coerce_str_list(raw.get("follow_ups")),
+        "upcoming_appointments": _coerce_str_list(raw.get("upcoming_appointments")),
+        "doctor_instructions": _coerce_str_list(raw.get("doctor_instructions")),
+        "lifestyle_recommendations": _coerce_str_list(raw.get("lifestyle_recommendations")),
+        "warnings": _coerce_str_list(raw.get("warnings")),
+        "questions_for_next_visit": _coerce_str_list(raw.get("questions_for_next_visit")),
+        "_meta": {"error": None},
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Structured-field merge (symptoms / notes)                                   #
+# --------------------------------------------------------------------------- #
+
+def merge_extraction_into_appointment(*, user, appointment, result: "ExtractionResult") -> Dict[str, int]:
+    """Merge voice-extracted symptoms/conditions/instructions into the SAME
+    appointment sections (Symptom, Note) that text-entered data uses.
+
+    This is strictly additive/append-only: existing user-entered rows are
+    never modified or deleted. Duplicate detection is a simple case-insensitive
+    match on `name` (symptoms) / `content` (notes) scoped to this appointment,
+    so re-running extraction (or combining voice + text) doesn't create
+    duplicate rows.
+
+    Medication candidates are handled separately by `reconcile_from_voice`
+    (medications are a user-level list, not appointment-scoped).
+    """
+    from .models import Symptom, Note
+
+    created = {"symptoms": 0, "notes": 0}
+
+    existing_symptom_names = {
+        s.name.strip().lower()
+        for s in Symptom.objects.filter(appointment=appointment, user=user)
+        if s.name
+    }
+    for sym in result.symptoms:
+        name = (sym.name or "").strip()
+        if not name or name.lower() in existing_symptom_names:
+            continue
+        severity_int = 5
+        try:
+            if sym.severity:
+                severity_int = max(1, min(10, int(round(float(sym.severity)))))
+        except Exception:
+            severity_int = 5
+        note_text = (
+            f"Detected from voice recording (confidence {sym.confidence:.2f})"
+            if sym.confidence
+            else "Detected from voice recording"
+        )
+        Symptom.objects.create(
+            user=user,
+            appointment=appointment,
+            name=name,
+            severity=severity_int,
+            is_new=True,
+            is_worsening=False,
+            notes=note_text,
+        )
+        existing_symptom_names.add(name.lower())
+        created["symptoms"] += 1
+
+    existing_note_contents = {
+        (n.content or "").strip().lower()
+        for n in Note.objects.filter(appointment=appointment, user=user)
+    }
+
+    def _add_note(title: str, content: str, category: str) -> None:
+        cleaned = (content or "").strip()
+        if not cleaned or cleaned.lower() in existing_note_contents:
+            return
+        Note.objects.create(user=user, appointment=appointment, title=title, content=cleaned, category=category)
+        existing_note_contents.add(cleaned.lower())
+        created["notes"] += 1
+
+    for instr in result.instructions:
+        _add_note("Voice note", instr.text, "voice_extracted")
+
+    for cond in result.conditions:
+        label = (cond.name or "").strip()
+        if not label:
+            continue
+        suffix = f" (ICD-10: {cond.icd10_code})" if cond.icd10_code else ""
+        _add_note("Condition mentioned", label + suffix, "voice_extracted")
+
+    return created
+
 # --------------------------------------------------------------------------- #
 
 @dataclass

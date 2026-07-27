@@ -729,6 +729,33 @@ def recording_detail_view(request, pk):
 
 # ============== Audio Upload + Transcription (NeuraVia) ==============
 
+def _generate_visit_summary_for_recording(recording) -> None:
+    """Run LLM-based post-visit summary generation for `recording` and persist
+    the structured result (or failure) onto it. Never raises — all failures
+    are captured into `visit_summary_status='failed'` + `visit_summary_error`
+    so the transcript/extraction pipeline this is called from never breaks.
+    """
+    from .clinical_extraction import generate_visit_summary
+
+    recording.visit_summary_status = 'processing'
+    recording.save(update_fields=['visit_summary_status', 'updated_at'])
+    try:
+        summary = generate_visit_summary(recording.transcript_text or '')
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("generate_visit_summary failed for recording=%s", recording.id)
+        recording.visit_summary_status = 'failed'
+        recording.visit_summary_error = str(exc)[:500]
+        recording.save(update_fields=['visit_summary_status', 'visit_summary_error', 'updated_at'])
+        return
+
+    meta = summary.pop('_meta', {}) if isinstance(summary, dict) else {}
+    error = meta.get('error') if isinstance(meta, dict) else None
+    recording.visit_summary = summary
+    recording.visit_summary_status = 'failed' if error else 'completed'
+    recording.visit_summary_error = str(error or '')[:500]
+    recording.save(update_fields=['visit_summary', 'visit_summary_status', 'visit_summary_error', 'updated_at'])
+
+
 @api_view(['POST'])
 def voice_dump_transcribe_view(request):
     # Deprecated: server-side audio transcription is no longer supported.
@@ -765,7 +792,50 @@ def audio_receive_transcript_view(request):
         recording.transcript_text = transcript
         recording.status = 'transcribed'
         recording.save()
-        return Response({'recording_id': recording.id, 'status': recording.status})
+
+        # Every completed transcript triggers LLM extraction AND the
+        # patient-facing post-visit summary (works for both voice-only
+        # recordings and mixed typed-notes + recording flows, since this
+        # endpoint is the single place transcripts land regardless of source).
+        merged_counts = {'symptoms': 0, 'notes': 0}
+        delta_summary = 'no changes'
+        try:
+            from .clinical_extraction import extract_from_transcript, reconcile_from_voice, merge_extraction_into_appointment
+
+            result = extract_from_transcript(recording.transcript_text or '')
+            recording.extracted_entities = result.to_payload()
+            recording.status = 'extracted'
+            recording.save()
+
+            if recording.appointment_id:
+                try:
+                    merged_counts = merge_extraction_into_appointment(
+                        user=request.user, appointment=recording.appointment, result=result,
+                    )
+                except Exception:
+                    logger.exception("merge_extraction_into_appointment failed for recording=%s", recording.id)
+
+            if result.medications:
+                try:
+                    delta = reconcile_from_voice(user=request.user, candidates=result.medications)
+                    delta_summary = delta.summary()
+                except Exception:
+                    logger.exception("Medication reconciliation failed for recording=%s", recording.id)
+        except Exception:
+            logger.exception("Clinical extraction failed for recording=%s", recording.id)
+
+        _generate_visit_summary_for_recording(recording)
+
+        return Response({
+            'recording_id': recording.id,
+            'status': recording.status,
+            'extracted_entities': recording.extracted_entities,
+            'reconciliation': delta_summary,
+            'merged_symptoms': merged_counts.get('symptoms', 0),
+            'merged_notes': merged_counts.get('notes', 0),
+            'visit_summary_status': recording.visit_summary_status,
+            'visit_summary': recording.visit_summary,
+        })
 
     if not appointment_id:
         return Response({'detail': 'appointment_id or recording_id is required'}, status=400)
@@ -787,7 +857,7 @@ def audio_receive_transcript_view(request):
 
     # Immediately run clinical extraction on the submitted transcript and persist results.
     try:
-        from .clinical_extraction import extract_from_transcript, MedicationCandidate, reconcile_from_voice
+        from .clinical_extraction import extract_from_transcript, reconcile_from_voice, merge_extraction_into_appointment
 
         result = extract_from_transcript(recording.transcript_text or '')
         payload = result.to_payload()
@@ -796,6 +866,15 @@ def audio_receive_transcript_view(request):
         recording.status = 'extracted'
         recording.extracted_entities = payload
         recording.save()
+
+        # Append-only merge into the SAME structured sections (Symptom, Note)
+        # that text-entered appointment data uses. Never overwrites/deletes
+        # existing user-entered rows — see merge_extraction_into_appointment().
+        merged_counts = {'symptoms': 0, 'notes': 0}
+        try:
+            merged_counts = merge_extraction_into_appointment(user=request.user, appointment=apt, result=result)
+        except Exception:
+            logger.exception("merge_extraction_into_appointment failed for appointment=%s", apt.id)
 
         delta_summary = 'no changes'
         if medications_for_reconcile:
@@ -815,16 +894,34 @@ def audio_receive_transcript_view(request):
             except Exception:
                 logger.exception("Medication reconciliation failed")
 
+        _generate_visit_summary_for_recording(recording)
+
         return Response({
             'recording_id': recording.id,
             'status': recording.status,
             'extracted_entities': recording.extracted_entities,
             'reconciliation': delta_summary,
+            'merged_symptoms': merged_counts.get('symptoms', 0),
+            'merged_notes': merged_counts.get('notes', 0),
+            'visit_summary_status': recording.visit_summary_status,
+            'visit_summary': recording.visit_summary,
         }, status=201)
     except Exception as exc:
         logger.exception('Extraction failed for submitted transcript: %s', exc)
-        # Return created recording but indicate extraction failure
-        return Response({'recording_id': recording.id, 'status': recording.status, 'extraction_error': str(exc)}, status=202)
+        # Return created recording but indicate extraction failure. Still
+        # attempt the visit summary — it only needs the transcript, not
+        # successful entity extraction.
+        try:
+            _generate_visit_summary_for_recording(recording)
+        except Exception:
+            logger.exception("visit summary fallback generation failed for recording=%s", recording.id)
+        return Response({
+            'recording_id': recording.id,
+            'status': recording.status,
+            'extraction_error': str(exc),
+            'visit_summary_status': recording.visit_summary_status,
+            'visit_summary': recording.visit_summary,
+        }, status=202)
 
 
 @api_view(['POST'])
@@ -871,6 +968,7 @@ def audio_extract_entities_view(request, pk):
 
     payload: dict
     medications_for_reconcile = []
+    extraction_result = None
     if isinstance(body.get('override_payload'), dict):
         payload = body['override_payload']
         # Allow clients/workers to pass a pre-extracted shape but still
@@ -895,16 +993,29 @@ def audio_extract_entities_view(request, pk):
     else:
         from .clinical_extraction import extract_from_transcript
         try:
-            result = extract_from_transcript(recording.transcript_text or '')
+            extraction_result = extract_from_transcript(recording.transcript_text or '')
         except Exception as exc:
             logger.exception("Transcript extraction failed: %s", exc)
             return Response({'detail': 'Clinical extraction failed', 'error': str(exc)}, status=502)
-        payload = result.to_payload()
-        medications_for_reconcile = result.medications
+        payload = extraction_result.to_payload()
+        medications_for_reconcile = extraction_result.medications
 
     recording.status = 'extracted'
     recording.extracted_entities = payload
     recording.save()
+
+    # Append-only merge into the SAME structured sections (Symptom, Note) that
+    # text-entered appointment data uses. Only runs for real LLM extractions
+    # (not override_payload, whose shape/provenance isn't guaranteed).
+    merged_counts = {'symptoms': 0, 'notes': 0}
+    if extraction_result is not None and recording.appointment_id:
+        try:
+            from .clinical_extraction import merge_extraction_into_appointment
+            merged_counts = merge_extraction_into_appointment(
+                user=request.user, appointment=recording.appointment, result=extraction_result,
+            )
+        except Exception:
+            logger.exception("merge_extraction_into_appointment failed for recording=%s", recording.id)
 
     delta_summary = 'no changes'
     if medications_for_reconcile:
@@ -926,12 +1037,80 @@ def audio_extract_entities_view(request, pk):
         except Exception:
             logger.exception("Medication reconciliation failed")
 
+    # Kick off (or retry) the patient-facing post-visit summary too, so this
+    # manual/legacy extraction endpoint stays in sync with the main
+    # transcript-receiving pipeline above.
+    if recording.transcript_text and recording.visit_summary_status in ('pending', 'failed'):
+        try:
+            _generate_visit_summary_for_recording(recording)
+        except Exception:
+            logger.exception("visit summary generation failed for recording=%s", recording.id)
+
     return Response({
         'recording_id': recording.id,
         'status': recording.status,
         'extracted_entities': recording.extracted_entities,
         'reconciliation': delta_summary,
+        'merged_symptoms': merged_counts.get('symptoms', 0),
+        'merged_notes': merged_counts.get('notes', 0),
+        'visit_summary_status': recording.visit_summary_status,
+        'visit_summary': recording.visit_summary,
     })
+
+
+@api_view(['POST'])
+def generate_visit_summary_view(request, pk):
+    """Manually (re)generate the structured post-visit summary for a
+    recording. Used by the frontend to retry after a failure, or to trigger
+    generation for recordings created before this feature existed.
+    """
+    try:
+        recording = Recording.objects.get(pk=pk, user=request.user)
+    except Recording.DoesNotExist:
+        return Response({'detail': 'Recording not found'}, status=404)
+
+    if not (recording.transcript_text or '').strip():
+        return Response({'detail': 'Recording has no transcript yet'}, status=400)
+
+    _generate_visit_summary_for_recording(recording)
+
+    resp = RecordingDetailSerializer(recording).data
+    resp['appointment_id'] = recording.appointment_id
+    return Response(resp)
+
+
+@api_view(['PATCH'])
+def recording_action_items_view(request, pk):
+    """Toggle the completed state of a single action item in a recording's
+    visit_summary.action_items list. Body: {"index": int, "completed": bool}.
+    """
+    try:
+        recording = Recording.objects.get(pk=pk, user=request.user)
+    except Recording.DoesNotExist:
+        return Response({'detail': 'Recording not found'}, status=404)
+
+    body = request.data if isinstance(request.data, dict) else {}
+    try:
+        index = int(body.get('index'))
+    except (TypeError, ValueError):
+        return Response({'detail': 'index is required'}, status=400)
+    completed = bool(body.get('completed'))
+
+    summary = recording.visit_summary if isinstance(recording.visit_summary, dict) else {}
+    items = summary.get('action_items')
+    if not isinstance(items, list) or not (0 <= index < len(items)):
+        return Response({'detail': 'Invalid action item index'}, status=400)
+
+    if not isinstance(items[index], dict):
+        items[index] = {'text': str(items[index]), 'completed': False}
+    items[index]['completed'] = completed
+    summary['action_items'] = items
+    recording.visit_summary = summary
+    recording.save(update_fields=['visit_summary', 'updated_at'])
+
+    resp = RecordingDetailSerializer(recording).data
+    resp['appointment_id'] = recording.appointment_id
+    return Response(resp)
 
 
 # ============== Summary View ==============

@@ -47,6 +47,8 @@ urlpatterns = [
     # Recordings
     path('recordings', views.recordings_view),
     path('recordings/<int:pk>', views.recording_detail_view),
+    path('recordings/<int:pk>/generate-summary', views.generate_visit_summary_view),
+    path('recordings/<int:pk>/action-items', views.recording_action_items_view),
 
     # Audio pipeline (local-only recording + transcription)
     # Deprecated: server-side transcription endpoints removed in favor of on-device recognition

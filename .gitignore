@@ -94,4 +94,5 @@ credentials.json
 .credentials
 ./.env
 ./env
-.env
+.env__pycache__/
+*.pyc

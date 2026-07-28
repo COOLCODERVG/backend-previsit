@@ -860,7 +860,4 @@ def build_custom_summary_pdf(summary_payload, export_preferences=None, ai_guidan
     pdf_bytes = buffer.getvalue()
     buffer.close()
 
-    doctor = (appointment.get('doctor_name') or 'appointment').replace(' ', '_')
-    apt_date = appointment.get('appointment_date') or datetime.utcnow().strftime('%Y-%m-%d')
-    filename = f'SyniVia_{doctor}_{apt_date}.pdf'
-    return pdf_bytes, filename
+    return pdf_bytes

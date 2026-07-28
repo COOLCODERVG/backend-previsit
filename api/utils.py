@@ -555,12 +555,161 @@ def generate_visit_one_pager(summary_payload, *, view_mode="standard", user_id=N
     return normalized, source
 
 
+_VAGUE_QUESTION_MARKERS = {
+    'nope', 'no', 'none', 'n/a', 'na', 'nothing', 'no questions', 'not sure',
+    'idk', "dont know", "don't know", 'no q', 'no qs', '-', '.',
+}
+
+
+def is_vague_text(text):
+    """True when a free-text field is effectively empty/non-informative
+    (e.g. "Nope", "N/A", "-"). Used to avoid generating hollow PDF sections
+    from placeholder answers."""
+    value = str(text or '').strip().lower().strip('.! ')
+    if len(value) < 3:
+        return True
+    return value in _VAGUE_QUESTION_MARKERS
+
+
+def _infer_communication_style(personalization):
+    """Best-effort communication-style preference from onboarding Q&A pairs
+    (no dedicated model field exists yet, so this scans ml_preferences)."""
+    for item in (personalization.get('ml_preferences') or []):
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get('question') or '').lower()
+        if 'communicat' in question or 'style' in question or 'explain' in question:
+            answer = str(item.get('answer') or '').strip()
+            if answer:
+                return _sanitize_for_llm(answer, 120)
+    return 'plain-language, empathetic'
+
+
+_APPOINTMENT_OUTCOME_LABELS = {
+    'clear_diagnosis': 'Wants a clear diagnosis',
+    'next_steps_plan': 'Wants next steps or a treatment plan',
+    'tests_or_referrals': 'Wants tests or referrals',
+    'heard_understood': 'Wants to feel heard and understood',
+}
+
+
+def _note_sentiment(content):
+    text = str(content or '').lower()
+    negative_markers = ('bad', 'worried', 'anxious', 'scared', 'stressed', 'worse', 'terrible', 'awful', 'pain', 'sad')
+    positive_markers = ('good', 'fine', 'better', 'great', 'improving', 'okay', 'ok', 'well')
+    if any(m in text for m in negative_markers):
+        return 'negative'
+    if any(m in text for m in positive_markers):
+        return 'positive'
+    return 'neutral'
+
+
+def build_llm_context(summary_payload, export_preferences=None):
+    """Builds the structured LLM context object (see PART 1 of the export spec):
+
+    {
+      appointment: {doctor_name, specialty, date, time, purpose},
+      patient_preferences: {communication_style, concerns, goals, preparation_preferences},
+      symptoms: [{name, severity, duration, description}],
+      questions_for_provider: [{question, priority}],
+      notes: [{content, category, sentiment}]
+    }
+
+    This is a structured, purpose-built object -- distinct from the legacy
+    de-identified `_build_deidentified_llm_payload` blob -- so the LLM prompt
+    receives clearly-labelled, personalized fields instead of a raw DB dump.
+    """
+    appointment = summary_payload.get('appointment') or {}
+    personalization = summary_payload.get('personalization_profile') or {}
+    symptoms = summary_payload.get('symptoms') or []
+    questions = summary_payload.get('questions') or []
+    notes = summary_payload.get('notes') or []
+
+    purpose = _sanitize_for_llm(appointment.get('notes'), 300) or _sanitize_for_llm(
+        personalization.get('main_reason'), 300
+    )
+
+    context = {
+        'appointment': {
+            'doctor_name': _sanitize_for_llm(appointment.get('doctor_name'), 120),
+            'specialty': _sanitize_for_llm(appointment.get('specialty'), 80),
+            'date': appointment.get('appointment_date') or '',
+            'time': appointment.get('appointment_time') or '',
+            'purpose': purpose,
+        },
+        'patient_preferences': {
+            'communication_style': _infer_communication_style(personalization),
+            'concerns': _sanitize_for_llm(personalization.get('biggest_concern'), 280),
+            'goals': _APPOINTMENT_OUTCOME_LABELS.get(
+                personalization.get('appointment_outcome') or '', ''
+            ) or _sanitize_for_llm(personalization.get('main_reason'), 200),
+            'preparation_preferences': [
+                str(v) for v in (personalization.get('prepared_items') or [])
+            ],
+        },
+        'symptoms': [
+            {
+                'name': _sanitize_for_llm(s.get('name'), 80),
+                'severity': s.get('severity'),
+                'duration': _sanitize_for_llm(s.get('duration'), 60),
+                'description': _sanitize_for_llm(s.get('notes'), 280),
+            }
+            for s in symptoms[:_LLM_MAX_SYMPTOMS]
+        ],
+        'questions_for_provider': [
+            {
+                'question': _sanitize_for_llm(q.get('text'), 280),
+                'priority': q.get('priority') or 0,
+            }
+            for q in questions
+            if not q.get('is_answered') and not is_vague_text(q.get('text'))
+        ][:_LLM_MAX_QUESTIONS],
+        'notes': [
+            {
+                'content': _sanitize_for_llm(n.get('content'), 400),
+                'category': n.get('category') or 'general',
+                'sentiment': _note_sentiment(n.get('content')),
+            }
+            for n in notes[:_LLM_MAX_NOTES]
+        ],
+    }
+    return context
+
+
+def _log_llm_context_debug(llm_context, summary_payload, user_id=None):
+    """Non-sensitive logging: presence/shape only, never raw field values."""
+    personalization = summary_payload.get('personalization_profile')
+    appointment = llm_context.get('appointment') or {}
+    prefs = llm_context.get('patient_preferences') or {}
+
+    logger.info(
+        "pdf_guidance context_check user=%s personalization_present=%s "
+        "personalization_fields=%s appointment_context_present=%s "
+        "symptoms_included=%s questions_included=%s notes_included=%s",
+        user_id,
+        bool(personalization),
+        sorted([k for k, v in prefs.items() if v]) if personalization else [],
+        bool(appointment.get('doctor_name') or appointment.get('specialty') or appointment.get('date')),
+        len(llm_context.get('symptoms') or []),
+        len(llm_context.get('questions_for_provider') or []),
+        len(llm_context.get('notes') or []),
+    )
+
+
 def generate_llm_pdf_guidance(summary_payload, export_preferences=None, user_id=None):
     llm_payload = _build_deidentified_llm_payload(
         summary_payload,
         export_preferences,
         user_id=user_id,
     )
+
+    # Structured, purpose-built context (PART 1): explicit appointment/
+    # personalization/symptoms/questions/notes object handed to the LLM
+    # alongside the legacy de-identified payload for backward compatibility.
+    llm_context = build_llm_context(summary_payload, export_preferences)
+    _log_llm_context_debug(llm_context, summary_payload, user_id=user_id)
+    llm_payload['structured_context'] = llm_context
+
     retrieval_query = None
     try:
         retrieval_query = build_pdf_guidance_retrieval_query(llm_payload)

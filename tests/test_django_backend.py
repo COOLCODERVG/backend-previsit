@@ -486,4 +486,34 @@ class TestSummary:
 
         decoded = base64.b64decode(data['content_base64'])
         assert decoded.startswith(b'%PDF')
+
+        # PART 5 — verify the download_url path independently returns a
+        # real PDF (application/pdf, %PDF header) with auth required, and
+        # that content_base64 (relied on by other tests/consumers) is untouched.
+        download_url = data['download_url']
+        dl_response = api_client.get(download_url, headers=auth_headers)
+        assert dl_response.status_code == 200
+        assert dl_response.headers.get('content-type', '').startswith('application/pdf')
+        assert dl_response.content.startswith(b'%PDF')
         print("✓ PDF export endpoint working")
+
+    def test_export_summary_pdf_download_requires_auth(self, base_url, api_client, auth_headers):
+        """download_url must not be publicly fetchable without a valid bearer token."""
+        apt_response = api_client.post(f"{base_url}/api/appointments", headers=auth_headers, json={
+            "doctor_name": "TEST Dr. Export Auth",
+            "appointment_date": "2026-06-02",
+            "appointment_time": "09:00",
+        })
+        apt_id = apt_response.json()['id']
+
+        export_response = api_client.post(
+            f"{base_url}/api/appointments/{apt_id}/export-pdf",
+            headers=auth_headers,
+            json={"use_ai_personalization": False},
+        )
+        assert export_response.status_code == 200
+        download_url = export_response.json()['download_url']
+
+        unauthenticated = api_client.get(download_url)
+        assert unauthenticated.status_code in (401, 403, 404)
+        print("✓ PDF download_url requires authentication")

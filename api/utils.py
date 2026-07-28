@@ -543,7 +543,7 @@ def generate_visit_one_pager(summary_payload, *, view_mode="standard", user_id=N
         deidentified_payload=llm_payload,
         steering_vectors=steering_vectors,
         view_mode=view_mode,
-        timeout_seconds=35,
+        timeout_seconds=60,
     )
     source = "llm" if isinstance(raw, dict) and raw.get("headline") else "fallback"
     normalized = _normalize_one_pager(raw if isinstance(raw, dict) else None, summary_payload, view_mode)
@@ -585,7 +585,7 @@ def generate_llm_pdf_guidance(summary_payload, export_preferences=None, user_id=
     guidance = call_llama_pdf_guidance(
         deidentified_payload=llm_payload,
         steering_vectors=steering_vectors,
-        timeout_seconds=20,
+        timeout_seconds=60,
     )
     if not isinstance(guidance, dict):
         return None

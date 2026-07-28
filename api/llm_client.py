@@ -181,6 +181,27 @@ def _serialize_prompt_for_ollama(body: Dict[str, Any], *, correction_note: Optio
         f"Task: {task}",
     ]
 
+    def _truncate_long_strings(obj: Any, max_len: int = 2000) -> Any:
+        """Recursively truncate long string values in nested dicts/lists to keep
+        Ollama prompts CPU-friendly and avoid sending excessive payloads.
+        """
+        if isinstance(obj, str):
+            if len(obj) > max_len:
+                return obj[:max_len].rstrip() + '...'
+            return obj
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                # Truncate known large fields aggressively
+                if k in ("transcript", "transcript_dump", "voice_transcript", "combined_text") and isinstance(v, str):
+                    out[k] = v[:max_len].rstrip() + ("..." if len(v) > max_len else "")
+                else:
+                    out[k] = _truncate_long_strings(v, max_len=max_len)
+            return out
+        if isinstance(obj, list):
+            return [_truncate_long_strings(x, max_len=max_len) for x in obj]
+        return obj
+
     if steering_vectors:
         lines.append(
             f"(Personalization context: {len(steering_vectors)} steering vector(s) "
@@ -188,9 +209,11 @@ def _serialize_prompt_for_ollama(body: Dict[str, Any], *, correction_note: Optio
             "implicitly in tone and emphasis.)"
         )
 
-    lines.append("Input data (JSON):")
+    # Truncate huge fields to keep the prompt small for CPU inference.
     try:
-        lines.append(json.dumps(input_payload, ensure_ascii=False, default=str))
+        safe_input = _truncate_long_strings(input_payload, max_len=2000)
+        lines.append("Input data (JSON):")
+        lines.append(json.dumps(safe_input, ensure_ascii=False, default=str))
     except Exception:
         lines.append(str(input_payload))
 
@@ -325,11 +348,20 @@ def _validate_required_fields(task: str, parsed: Optional[Dict[str, Any]]) -> Op
         return "output_not_a_dict"
 
     required = REQUIRED_FIELDS_BY_TASK.get(task, [])
-    missing = [
-        field
-        for field in required
-        if not str(parsed.get(field, "")).strip()
-    ]
+    missing = []
+    for field in required:
+        val = parsed.get(field, None)
+        if val is None:
+            missing.append(field)
+            continue
+        # Treat empty strings/empty lists as missing
+        if isinstance(val, str) and not val.strip():
+            missing.append(field)
+            continue
+        if isinstance(val, (list, dict)) and len(val) == 0:
+            missing.append(field)
+            continue
+
     if missing:
         return f"missing_or_empty_fields:{','.join(missing)}"
     return None
@@ -421,7 +453,7 @@ def call_llama_inference(
     steering_vectors: List[Dict[str, Any]],
     generation: Optional[Dict[str, Any]] = None,
     response_format: Optional[Dict[str, Any]] = None,
-    timeout_seconds: int = 30,
+    timeout_seconds: int = 60,
 ) -> Optional[Dict[str, Any]]:
     """Calls the local Ollama model, validates the parsed JSON output against
     the task's required fields, and retries ONCE with an explicit correction

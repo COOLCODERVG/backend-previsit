@@ -29,6 +29,7 @@ from .utils import (
     generate_llm_pdf_guidance,
     generate_visit_one_pager,
     persist_export_pdf,
+    build_custom_summary_pdf,
 )
 from .pdf_renderer import render_summary_html, html_to_pdf_bytes
 from .object_store import resolve_local_store, sniff_audio_content_type
@@ -77,6 +78,8 @@ def _transcript_text_from_aws_json(data: dict) -> str:
 
 
 def _load_transcript_bytes_from_uri(uri: str) -> bytes:
+    from .s3 import get_bytes, parse_s3_uri
+
     parsed = parse_s3_uri(uri)
     if parsed:
         bucket, key = parsed
@@ -1264,16 +1267,28 @@ def export_summary_pdf_view(request, pk):
 
     ai_guidance = None
     if use_ai_personalization:
-        ai_guidance = generate_llm_pdf_guidance(summary_payload, export_preferences, user_id=request.user.id)
+        try:
+            ai_guidance = generate_llm_pdf_guidance(summary_payload, export_preferences, user_id=request.user.id)
+        except Exception:
+            logger.exception("generate_llm_pdf_guidance failed for appointment=%s user=%s", apt.id, request.user.id)
+            ai_guidance = None
 
+    # Render HTML -> PDF. If AI guidance causes rendering to fail, fall back
+    # to a non-AI PDF generator so exports never fail due to LLM issues.
     try:
         html = render_summary_html(summary_payload, ai_guidance=ai_guidance)
         pdf_bytes = html_to_pdf_bytes(html)
-        doctor = (summary_payload.get("appointment") or {}).get("doctor_name") or "appointment"
-        apt_date = (summary_payload.get("appointment") or {}).get("appointment_date") or timezone.now().strftime("%Y-%m-%d")
-        filename = f"SyniVia_{doctor.replace(' ', '_')}_{apt_date}.pdf"
-    except RuntimeError as exc:
-        return Response({'detail': str(exc)}, status=500)
+    except Exception:
+        logger.exception("HTML->PDF rendering failed; falling back to basic PDF for appointment=%s user=%s", apt.id, request.user.id)
+        try:
+            pdf_bytes = build_custom_summary_pdf(summary_payload, export_preferences=export_preferences, ai_guidance=None)
+        except Exception as exc:
+            logger.exception("Fallback PDF generation failed for appointment=%s user=%s", apt.id, request.user.id)
+            return Response({'detail': 'PDF generation failed'}, status=500)
+
+    doctor = (summary_payload.get("appointment") or {}).get("doctor_name") or "appointment"
+    apt_date = (summary_payload.get("appointment") or {}).get("appointment_date") or timezone.now().strftime("%Y-%m-%d")
+    filename = f"SyniVia_{doctor.replace(' ', '_')}_{apt_date}.pdf"
 
     encoded = base64.b64encode(pdf_bytes).decode('utf-8')
 

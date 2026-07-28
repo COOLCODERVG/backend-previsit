@@ -539,12 +539,17 @@ def generate_visit_one_pager(summary_payload, *, view_mode="standard", user_id=N
     except Exception:
         logger.exception("one_pager RAG retrieval failed for user=%s", user_id)
 
-    raw = call_llama_visit_one_pager(
-        deidentified_payload=llm_payload,
-        steering_vectors=steering_vectors,
-        view_mode=view_mode,
-        timeout_seconds=60,
-    )
+    try:
+        raw = call_llama_visit_one_pager(
+            deidentified_payload=llm_payload,
+            steering_vectors=steering_vectors,
+            view_mode=view_mode,
+            timeout_seconds=60,
+        )
+    except Exception:
+        logger.exception("one_pager LLM call raised unexpected exception for user=%s", user_id)
+        raw = None
+
     source = "llm" if isinstance(raw, dict) and raw.get("headline") else "fallback"
     normalized = _normalize_one_pager(raw if isinstance(raw, dict) else None, summary_payload, view_mode)
     return normalized, source
@@ -582,11 +587,16 @@ def generate_llm_pdf_guidance(summary_payload, export_preferences=None, user_id=
     except Exception:
         logger.exception("pdf_guidance RAG retrieval failed for user=%s", user_id)
 
-    guidance = call_llama_pdf_guidance(
-        deidentified_payload=llm_payload,
-        steering_vectors=steering_vectors,
-        timeout_seconds=60,
-    )
+    try:
+        guidance = call_llama_pdf_guidance(
+            deidentified_payload=llm_payload,
+            steering_vectors=steering_vectors,
+            timeout_seconds=60,
+        )
+    except Exception:
+        logger.exception("pdf_guidance LLM call raised unexpected exception for user=%s", user_id)
+        guidance = None
+
     if not isinstance(guidance, dict):
         return None
 

@@ -176,8 +176,11 @@ def _serialize_prompt_for_ollama(body: Dict[str, Any], *, correction_note: Optio
     steering_vectors = body.get("steering") or []
     response_format = body.get("response_format")
 
+    # Kept intentionally short: every extra sentence here adds latency and
+    # token cost on every single call. Only the instructions the model
+    # actually needs to produce valid, on-schema JSON are included.
     lines: List[str] = [
-        "You are the SyniVia clinical visit-prep assistant.",
+        "You are SyniVia, a clinical visit-prep assistant.",
         f"Task: {task}",
     ]
 
@@ -203,16 +206,12 @@ def _serialize_prompt_for_ollama(body: Dict[str, Any], *, correction_note: Optio
         return obj
 
     if steering_vectors:
-        lines.append(
-            f"(Personalization context: {len(steering_vectors)} steering vector(s) "
-            "supplied by the upstream personalization system; reflect their guidance "
-            "implicitly in tone and emphasis.)"
-        )
+        lines.append(f"({len(steering_vectors)} personalization steering vector(s) supplied; reflect tone only.)")
 
     # Truncate huge fields to keep the prompt small for CPU inference.
     try:
         safe_input = _truncate_long_strings(input_payload, max_len=2000)
-        lines.append("Input data (JSON):")
+        lines.append("Input (JSON):")
         lines.append(json.dumps(safe_input, ensure_ascii=False, default=str))
     except Exception:
         lines.append(str(input_payload))
@@ -220,24 +219,19 @@ def _serialize_prompt_for_ollama(body: Dict[str, Any], *, correction_note: Optio
     if isinstance(response_format, dict) and response_format.get("schema"):
         schema = response_format["schema"]
         lines.append(
-            "STRICT OUTPUT RULES:\n"
-            "1. Output ONLY a single valid JSON object. Nothing else.\n"
-            "2. Do NOT use markdown, code fences, backticks, or any commentary.\n"
-            "3. Do NOT explain your reasoning before or after the JSON.\n"
-            "4. Do NOT include any text outside the { } braces.\n"
-            "5. Follow this schema EXACTLY (same keys, same value types). Use empty "
-            'strings/arrays for anything unknown — never omit a key:\n'
-            f"{json.dumps(schema, ensure_ascii=False)}\n"
-            "Your entire response must start with '{' and end with '}'."
+            "Return ONLY valid JSON matching this exact schema. No markdown, no code "
+            "fences, no explanations, no extra keys, no text outside the JSON object. "
+            "Use empty strings/arrays for unknown values — never omit a key. Your "
+            "entire response must start with '{' and end with '}'.\n"
+            f"Schema: {json.dumps(schema, ensure_ascii=False)}"
         )
     else:
         lines.append("Respond with a concise, helpful answer.")
 
     if correction_note:
         lines.append(
-            "IMPORTANT CORRECTION: Your previous response was invalid "
-            f"({correction_note}). Re-read the STRICT OUTPUT RULES above and "
-            "respond again with ONLY the corrected JSON object."
+            f"CORRECTION: previous response was invalid ({correction_note}). "
+            "Respond again with ONLY the corrected JSON object."
         )
 
     return "\n\n".join(lines)

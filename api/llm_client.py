@@ -162,29 +162,22 @@ def build_inference_request(
     return body
 
 
-def _serialize_prompt_for_ollama(body: Dict[str, Any], *, correction_note: Optional[str] = None) -> str:
+def _serialize_prompt_for_ollama(body: Dict[str, Any]) -> str:
     """Convert the existing structured `build_inference_request()` body into a
-    single text prompt that a plain-text completion API (Ollama `/api/generate`)
-    can consume, while preserving the same task/input/steering/schema contract.
+    single, minimal text prompt for Ollama's `/api/generate`.
 
-    When `correction_note` is provided (used on the one automatic retry after an
-    invalid/unparseable first response), the prompt is amended with an explicit
-    instruction to fix the previous mistake.
+    Kept as short as possible: every extra sentence here adds latency and
+    token cost on every call. Personalization/steering context still
+    influences the model (via the input payload + steering vectors), but the
+    model is only ever asked to produce new human-facing content, never to
+    reproduce the input structure back in its output.
     """
     task = body.get("task") or "general"
     input_payload = body.get("input") or {}
     steering_vectors = body.get("steering") or []
     response_format = body.get("response_format")
 
-    # Kept intentionally short: every extra sentence here adds latency and
-    # token cost on every single call. Only the instructions the model
-    # actually needs to produce valid, on-schema JSON are included.
-    lines: List[str] = [
-        "You are SyniVia, a clinical visit-prep assistant.",
-        f"Task: {task}",
-    ]
-
-    def _truncate_long_strings(obj: Any, max_len: int = 2000) -> Any:
+    def _truncate_long_strings(obj: Any, max_len: int = 1200) -> Any:
         """Recursively truncate long string values in nested dicts/lists to keep
         Ollama prompts CPU-friendly and avoid sending excessive payloads.
         """
@@ -195,7 +188,6 @@ def _serialize_prompt_for_ollama(body: Dict[str, Any], *, correction_note: Optio
         if isinstance(obj, dict):
             out = {}
             for k, v in obj.items():
-                # Truncate known large fields aggressively
                 if k in ("transcript", "transcript_dump", "voice_transcript", "combined_text") and isinstance(v, str):
                     out[k] = v[:max_len].rstrip() + ("..." if len(v) > max_len else "")
                 else:
@@ -205,36 +197,27 @@ def _serialize_prompt_for_ollama(body: Dict[str, Any], *, correction_note: Optio
             return [_truncate_long_strings(x, max_len=max_len) for x in obj]
         return obj
 
-    if steering_vectors:
-        lines.append(f"({len(steering_vectors)} personalization steering vector(s) supplied; reflect tone only.)")
-
-    # Truncate huge fields to keep the prompt small for CPU inference.
     try:
-        safe_input = _truncate_long_strings(input_payload, max_len=2000)
-        lines.append("Input (JSON):")
-        lines.append(json.dumps(safe_input, ensure_ascii=False, default=str))
+        safe_input = _truncate_long_strings(input_payload)
+        input_json = json.dumps(safe_input, ensure_ascii=False, default=str)
     except Exception:
-        lines.append(str(input_payload))
+        input_json = str(input_payload)
 
+    schema_json = None
     if isinstance(response_format, dict) and response_format.get("schema"):
-        schema = response_format["schema"]
-        lines.append(
+        schema_json = json.dumps(response_format["schema"], ensure_ascii=False)
+
+    steering_note = f" {len(steering_vectors)} personalization signal(s) supplied; reflect tone only." if steering_vectors else ""
+
+    if schema_json:
+        return (
+            f"Task: {task}.{steering_note}\n"
             "Return ONLY valid JSON matching this exact schema. No markdown, no code "
-            "fences, no explanations, no extra keys, no text outside the JSON object. "
-            "Use empty strings/arrays for unknown values — never omit a key. Your "
-            "entire response must start with '{' and end with '}'.\n"
-            f"Schema: {json.dumps(schema, ensure_ascii=False)}"
+            "fences, no explanations, no extra keys, no text outside the JSON object.\n"
+            f"Schema: {schema_json}\n"
+            f"Data: {input_json}"
         )
-    else:
-        lines.append("Respond with a concise, helpful answer.")
-
-    if correction_note:
-        lines.append(
-            f"CORRECTION: previous response was invalid ({correction_note}). "
-            "Respond again with ONLY the corrected JSON object."
-        )
-
-    return "\n\n".join(lines)
+    return f"Task: {task}.{steering_note}\nData: {input_json}\nRespond with a concise, helpful answer."
 
 
 def _parse_llm_json_output(text: Optional[str]) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -257,27 +240,38 @@ def _parse_llm_json_output(text: Optional[str]) -> tuple[Optional[Dict[str, Any]
     if fence_match:
         cleaned = fence_match.group(1).strip()
 
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict):
-            return parsed, None
-        return None, "parsed_json_not_object"
-    except Exception:
-        pass
+    parsed = _try_parse_json(cleaned)
+    if parsed is not None:
+        return parsed, None
 
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start != -1 and end != -1 and end > start:
         candidate = cleaned[start : end + 1]
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed, None
-            return None, "embedded_json_not_object"
-        except Exception as exc:
-            return None, f"embedded_json_decode_error:{exc}"
+        parsed = _try_parse_json(candidate)
+        if parsed is not None:
+            return parsed, None
+        # Local repair only (no second LLM call): fix the most common minor
+        # formatting mistakes models make — trailing commas before a closing
+        # brace/bracket and stray single quotes used instead of double quotes.
+        repaired = re.sub(r",\s*([}\]])", r"\1", candidate)
+        repaired = repaired.replace("'", '"')
+        parsed = _try_parse_json(repaired)
+        if parsed is not None:
+            return parsed, None
+        return None, "embedded_json_decode_error"
 
     return None, "no_json_found_in_response"
+
+
+def _try_parse_json(text: str) -> Optional[Dict[str, Any]]:
+    """Parses `text` as JSON, returning the dict on success or None on any
+    failure (invalid JSON, or valid JSON that isn't an object)."""
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _invoke_via_http(
@@ -285,7 +279,6 @@ def _invoke_via_http(
     url: str,
     body: Dict[str, Any],
     timeout_seconds: int,
-    correction_note: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Transport: local Ollama server running the `synivia-model` model.
 
@@ -298,25 +291,30 @@ def _invoke_via_http(
     back into a dict so the rest of the pipeline (schema-shaped dicts) is
     unaffected.
 
-    Also forwards `generation.temperature` / `generation.max_tokens` as Ollama's
-    `options.temperature` / `options.num_predict`, and sets `"format": "json"` so
-    Ollama constrains its output to valid JSON at the sampling level (in addition
-    to the strict-JSON prompt instructions).
+    Options are tuned for fast, deterministic, structured healthcare document
+    generation: low temperature, a hard cap on generated tokens (num_predict)
+    so the model can't ramble, top_p for a tighter sampling distribution, and
+    `keep_alive` so Ollama keeps the model warm in memory between requests
+    instead of reloading it (a major source of latency on the first call
+    after idle time).
     """
-    prompt = _serialize_prompt_for_ollama(body, correction_note=correction_note)
+    prompt = _serialize_prompt_for_ollama(body)
     generation = body.get("generation") if isinstance(body.get("generation"), dict) else {}
     temperature = generation.get("temperature", 0.1)
-    max_tokens = generation.get("max_tokens")
+    max_tokens = generation.get("max_tokens") or 400
 
-    options: Dict[str, Any] = {"temperature": temperature}
-    if isinstance(max_tokens, (int, float)) and max_tokens > 0:
-        options["num_predict"] = int(max_tokens)
+    options: Dict[str, Any] = {
+        "temperature": temperature,
+        "top_p": 0.9,
+        "num_predict": int(max_tokens),
+    }
 
     ollama_payload: Dict[str, Any] = {
         "model": body.get("model") or _model_id(),
         "prompt": prompt,
         "stream": False,
         "format": "json",
+        "keep_alive": "30m",
         "options": options,
     }
 
@@ -367,7 +365,6 @@ def _attempt_llm_call(
     body: Dict[str, Any],
     task: str,
     timeout_seconds: int,
-    correction_note: Optional[str] = None,
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Single HTTP round-trip to Ollama. Returns `(parsed_output, failure_reason)`.
 
@@ -375,6 +372,11 @@ def _attempt_llm_call(
     passes required-field validation for `task`. All failure paths are logged
     here with full context (endpoint, task, model, status code / error, and
     raw response text where available) so nothing fails silently.
+
+    There is NO retry-with-correction-prompt here — a second LLM call is
+    expensive and unnecessary. If the raw text fails to parse as-is,
+    `_parse_llm_json_output` already attempts local recovery (stripping code
+    fences, extracting the first balanced `{...}` block) before giving up.
     """
     endpoint = f"{url}/api/generate"
     try:
@@ -382,7 +384,6 @@ def _attempt_llm_call(
             url=url,
             body=body,
             timeout_seconds=timeout_seconds,
-            correction_note=correction_note,
         )
     except requests.exceptions.Timeout as exc:
         logger.error(
@@ -449,11 +450,14 @@ def call_llama_inference(
     response_format: Optional[Dict[str, Any]] = None,
     timeout_seconds: int = 60,
 ) -> Optional[Dict[str, Any]]:
-    """Calls the local Ollama model, validates the parsed JSON output against
-    the task's required fields, and retries ONCE with an explicit correction
-    prompt if the first attempt fails (bad HTTP, unparseable JSON, or missing
-    required fields). If the retry also fails, returns None and the caller
-    (e.g. `generate_visit_one_pager`) falls back to templated content — but
+    """Calls the local Ollama model ONCE and validates the parsed JSON output
+    against the task's required fields.
+
+    There is intentionally no second LLM call on failure — a retry round-trip
+    doubles generation latency for a structured-document use case where a
+    fast local JSON repair (see `_parse_llm_json_output`) is almost always
+    sufficient. If the single attempt still fails, this returns None and the
+    caller (e.g. `generate_visit_one_pager`) falls back to templated content —
     every failure is logged loudly with full context, so this is never silent.
     """
     url = _inference_url()
@@ -485,26 +489,9 @@ def call_llama_inference(
     if parsed is not None:
         return parsed
 
-    logger.warning(
-        "llm_inference first_attempt_failed task=%s model=%s reason=%s — retrying once with correction prompt",
-        task, body.get("model"), failure_reason,
-    )
-
-    parsed, retry_failure_reason = _attempt_llm_call(
-        url=url,
-        body=body,
-        task=task,
-        timeout_seconds=timeout_seconds,
-        correction_note=failure_reason or "invalid_or_missing_json",
-    )
-
-    if parsed is not None:
-        logger.info("llm_inference retry_succeeded task=%s model=%s", task, body.get("model"))
-        return parsed
-
     logger.error(
-        "llm_inference giving_up task=%s model=%s first_failure=%s retry_failure=%s — falling back to templated content",
-        task, body.get("model"), failure_reason, retry_failure_reason,
+        "llm_inference giving_up task=%s model=%s failure=%s — falling back to templated content (no retry call made)",
+        task, body.get("model"), failure_reason,
     )
     return None
 
@@ -521,7 +508,7 @@ def call_llama_visit_one_pager(
         task="visit_one_pager",
         input_payload=payload,
         steering_vectors=steering_vectors,
-        generation={"temperature": 0.1, "max_tokens": 900},
+        generation={"temperature": 0.1, "max_tokens": 400},
         response_format=VISIT_ONE_PAGER_RESPONSE_FORMAT,
         timeout_seconds=timeout_seconds,
     )
@@ -537,7 +524,7 @@ def call_llama_pdf_guidance(
         task="pdf_guidance",
         input_payload=deidentified_payload,
         steering_vectors=steering_vectors,
-        generation={"temperature": 0.1, "max_tokens": 700},
+        generation={"temperature": 0.1, "max_tokens": 400},
         response_format=PDF_GUIDANCE_RESPONSE_FORMAT,
         timeout_seconds=timeout_seconds,
     )

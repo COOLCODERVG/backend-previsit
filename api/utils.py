@@ -502,17 +502,18 @@ def _normalize_one_pager(raw, summary_payload, view_mode="standard"):
 
 
 def generate_visit_one_pager(summary_payload, *, view_mode="standard", user_id=None):
-    llm_payload = _build_deidentified_llm_payload(
+    # Full internal context — used ONLY for building the retrieval query and
+    # steering-vector lookup (personalization influences generation via these
+    # signals). It is never sent to the model as the prompt input anymore.
+    internal_context = _build_deidentified_llm_payload(
         summary_payload,
         {"layout_style": "detailed"},
         user_id=user_id,
     )
-    llm_payload["view_mode"] = view_mode
-    llm_payload["llm_input_coverage"] = assess_llm_input_coverage(summary_payload)
 
     retrieval_query = None
     try:
-        retrieval_query = build_pdf_guidance_retrieval_query(llm_payload)
+        retrieval_query = build_pdf_guidance_retrieval_query(internal_context)
     except Exception:
         logger.exception("one_pager retrieval query build failed for user=%s", user_id)
 
@@ -528,26 +529,32 @@ def generate_visit_one_pager(summary_payload, *, view_mode="standard", user_id=N
         logger.exception("one_pager steering retrieval failed for user=%s", user_id)
         steering_vectors = []
 
+    # Minimal payload actually sent to the LLM: appointment notes, symptoms,
+    # questions, and a compact preferences object — never the raw DB blob.
+    lean_input = build_lean_llm_generation_input(summary_payload)
+    lean_input["view_mode"] = view_mode
+
     # Knowledge-base RAG context (machinelearning/rag/pipeline.py via the embedding
     # service) -- independent of personalization steering and of user_id, since the
     # knowledge base (appointment prep FAQ/medications/notes) isn't user-specific.
     try:
         rag = retrieve_rag_context(retrieval_query or "", top_k=5)
         if rag.get("rag_context"):
-            llm_payload["rag_context"] = rag["rag_context"]
-            llm_payload["rag_citations"] = rag["rag_citations"]
+            lean_input["rag_context"] = rag["rag_context"]
+            lean_input["rag_citations"] = rag["rag_citations"]
     except Exception:
         logger.exception("one_pager RAG retrieval failed for user=%s", user_id)
 
     try:
         raw = call_llama_visit_one_pager(
-            deidentified_payload=llm_payload,
+            deidentified_payload=lean_input,
             steering_vectors=steering_vectors,
             view_mode=view_mode,
             timeout_seconds=60,
         )
     except Exception:
         logger.exception("one_pager LLM call raised unexpected exception for user=%s", user_id)
+
         raw = None
 
     source = "llm" if isinstance(raw, dict) and raw.get("headline") else "fallback"
@@ -676,6 +683,45 @@ def build_llm_context(summary_payload, export_preferences=None):
     return context
 
 
+def build_lean_llm_generation_input(summary_payload, *, tone=None):
+    """Builds the MINIMAL input payload actually sent to the LLM for content
+    generation (visit one-pager / PDF guidance).
+
+    Personalization/profile/DB data still INFLUENCES generation (it's read
+    here and folded into `preferences`, plus steering vectors and RAG context
+    are retrieved separately using the full internal context), but none of
+    the raw DB objects (personalization profile, ml_preferences, signals,
+    full symptom/question/note records, transcripts, etc.) are put in front
+    of the model. The model only ever sees:
+
+        {
+          "appointment_notes": "...",
+          "symptoms": ["..."],
+          "questions": ["..."],
+          "preferences": {"tone": "...", "concerns": "...", "goals": "..."}
+        }
+
+    This keeps the prompt small (faster generation) and removes any
+    incentive for the model to echo the input structure back in its output.
+    """
+    context = build_llm_context(summary_payload)
+    appointment = context.get('appointment') or {}
+    prefs = context.get('patient_preferences') or {}
+
+    return {
+        'appointment_notes': appointment.get('purpose') or '',
+        'symptoms': [s.get('name') for s in (context.get('symptoms') or []) if s.get('name')],
+        'questions': [
+            q.get('question') for q in (context.get('questions_for_provider') or []) if q.get('question')
+        ],
+        'preferences': {
+            'tone': tone or prefs.get('communication_style') or 'concise',
+            'concerns': prefs.get('concerns') or '',
+            'goals': prefs.get('goals') or '',
+        },
+    }
+
+
 def _log_llm_context_debug(llm_context, summary_payload, user_id=None):
     """Non-sensitive logging: presence/shape only, never raw field values."""
     personalization = summary_payload.get('personalization_profile')
@@ -697,22 +743,24 @@ def _log_llm_context_debug(llm_context, summary_payload, user_id=None):
 
 
 def generate_llm_pdf_guidance(summary_payload, export_preferences=None, user_id=None):
-    llm_payload = _build_deidentified_llm_payload(
+    # Full internal context — used ONLY for building the retrieval query and
+    # steering-vector lookup / debug logging. Never sent to the model directly.
+    internal_context = _build_deidentified_llm_payload(
         summary_payload,
         export_preferences,
         user_id=user_id,
     )
 
     # Structured, purpose-built context (PART 1): explicit appointment/
-    # personalization/symptoms/questions/notes object handed to the LLM
-    # alongside the legacy de-identified payload for backward compatibility.
+    # personalization/symptoms/questions/notes object — used for retrieval
+    # query building and debug logging only (not sent to the model as-is).
     llm_context = build_llm_context(summary_payload, export_preferences)
     _log_llm_context_debug(llm_context, summary_payload, user_id=user_id)
-    llm_payload['structured_context'] = llm_context
+    internal_context['structured_context'] = llm_context
 
     retrieval_query = None
     try:
-        retrieval_query = build_pdf_guidance_retrieval_query(llm_payload)
+        retrieval_query = build_pdf_guidance_retrieval_query(internal_context)
     except Exception:
         logger.exception("pdf_guidance retrieval query build failed for user=%s", user_id)
 
@@ -728,20 +776,26 @@ def generate_llm_pdf_guidance(summary_payload, export_preferences=None, user_id=
         logger.exception("pdf_guidance steering retrieval failed for user=%s", user_id)
         steering_vectors = []
 
+    # Minimal payload actually sent to the LLM: appointment notes, symptoms,
+    # questions, and a compact preferences object — never the raw DB blob.
+    tone_pref = (export_preferences or {}).get('tone') if isinstance(export_preferences, dict) else None
+    lean_input = build_lean_llm_generation_input(summary_payload, tone=tone_pref)
+
     try:
         rag = retrieve_rag_context(retrieval_query or "", top_k=5)
         if rag.get("rag_context"):
-            llm_payload["rag_context"] = rag["rag_context"]
-            llm_payload["rag_citations"] = rag["rag_citations"]
+            lean_input["rag_context"] = rag["rag_context"]
+            lean_input["rag_citations"] = rag["rag_citations"]
     except Exception:
         logger.exception("pdf_guidance RAG retrieval failed for user=%s", user_id)
 
     try:
         guidance = call_llama_pdf_guidance(
-            deidentified_payload=llm_payload,
+            deidentified_payload=lean_input,
             steering_vectors=steering_vectors,
             timeout_seconds=60,
         )
+
     except Exception:
         logger.exception("pdf_guidance LLM call raised unexpected exception for user=%s", user_id)
         guidance = None

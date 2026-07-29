@@ -5,6 +5,7 @@ from rest_framework import status
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.http import FileResponse
 from django.utils import timezone
+from django.core import signing
 from pathlib import Path
 from datetime import timedelta
 import base64
@@ -1294,7 +1295,17 @@ def export_summary_pdf_view(request, pk):
 
     # Persist export locally and expose existing download endpoint.
     file_id = persist_export_pdf(pdf_bytes, request.user.id, filename)
-    download_url = request.build_absolute_uri(f'/api/exports/{file_id}')
+
+    # Sign a short-lived token binding this file_id to the requesting user, so
+    # the browser/WebView can navigate to the backend URL directly (address
+    # bar shows the real neuravia.ai domain, never a client-side blob: URL)
+    # without needing to attach an Authorization header. The token expires
+    # quickly (PDF_EXPORT_LINK_TTL_SECONDS) — it is a temporary, single-purpose
+    # download link, not a long-lived credential.
+    export_token = signing.TimestampSigner(salt='pdf-export-download').sign(f'{file_id}:{request.user.id}')
+    download_url = request.build_absolute_uri(f'/api/exports/{file_id}?token={export_token}')
+    # TEMP DEBUG — remove once the authenticated PDF flow is confirmed stable.
+    logger.info("[PDF DEBUG] export-pdf generated file_id=%s download_url=%s user_id=%s", file_id, download_url, request.user.id)
 
     # Store export metadata (single unified database — documents app tables).
     try:
@@ -1314,25 +1325,73 @@ def export_summary_pdf_view(request, pk):
         'mime_type': 'application/pdf',
         'content_base64': encoded,
         'download_url': download_url,
+        'download_url_expires_in_seconds': PDF_EXPORT_LINK_TTL_SECONDS,
         'personalization_applied': bool(summary_payload.get('personalization_profile')),
         'ai_personalization_requested': use_ai_personalization,
         'ai_personalization_used': bool(ai_guidance),
     })
 
 
+# Short-lived temporary download link window. The token embedded in
+# `download_url` stops working after this many seconds, so the link can be
+# opened directly by a browser/WebView (no Authorization header needed)
+# without becoming a standing, reusable credential.
+PDF_EXPORT_LINK_TTL_SECONDS = 900  # 15 minutes
+
+
 @api_view(['GET'])
+@permission_classes([AllowAny])
 def export_file_download_view(request, file_id):
-    expected_prefix = f'u{request.user.id}_'
+    # TEMP DEBUG — remove once the authenticated PDF flow is confirmed stable.
+    auth_header_present = bool(request.META.get('HTTP_AUTHORIZATION'))
+    token = request.query_params.get('token')
+
+    # Preferred path: a short-lived signed token in the query string. This is
+    # what lets the frontend open the backend URL directly (real neuravia.ai
+    # address bar, no client-side Blob/createObjectURL) since the browser
+    # cannot attach an Authorization header on a plain navigation.
+    token_user_id = None
+    if token:
+        try:
+            unsigned = signing.TimestampSigner(salt='pdf-export-download').unsign(
+                token, max_age=PDF_EXPORT_LINK_TTL_SECONDS,
+            )
+            signed_file_id, _, signed_user_id = unsigned.rpartition(':')
+            if signed_file_id == file_id:
+                token_user_id = int(signed_user_id)
+        except (signing.BadSignature, signing.SignatureExpired, ValueError):
+            token_user_id = None
+
+    # Fallback path: a normal authenticated request (Bearer header), used by
+    # native downloadAsync calls that already attach the access token.
+    header_user_id = getattr(request.user, 'id', None) if request.user and request.user.is_authenticated else None
+
+    requesting_user_id = token_user_id if token_user_id is not None else header_user_id
+    logger.info(
+        "[PDF DEBUG] exports download requested file_id=%s auth_header_present=%s token_present=%s user_id=%s",
+        file_id, auth_header_present, bool(token), requesting_user_id,
+    )
+
+    if requesting_user_id is None:
+        logger.info("[PDF DEBUG] exports download rejected: no valid token or session for file_id=%s", file_id)
+        return Response({'detail': 'Export file not found'}, status=404)
+
+    expected_prefix = f'u{requesting_user_id}_'
     if not file_id.startswith(expected_prefix):
+        logger.info("[PDF DEBUG] exports download rejected: file_id prefix mismatch for user_id=%s", requesting_user_id)
         return Response({'detail': 'Export file not found'}, status=404)
 
     base_dir = Path(__file__).resolve().parents[1]
     file_path = base_dir / 'exports' / file_id
     if not file_path.exists() or not file_path.is_file():
+        logger.info("[PDF DEBUG] exports download rejected: file not found on disk for file_id=%s", file_id)
         return Response({'detail': 'Export file not found'}, status=404)
 
+    logger.info("[PDF DEBUG] exports download succeeding for file_id=%s user_id=%s", file_id, requesting_user_id)
     response = FileResponse(open(file_path, 'rb'), content_type='application/pdf')
-    response['Content-Disposition'] = f'attachment; filename="{file_id.split("_", 2)[-1]}"'
+    # `inline` (not `attachment`) so navigating straight to this URL renders
+    # the PDF in the browser tab/WebView instead of forcing a file download.
+    response['Content-Disposition'] = f'inline; filename="{file_id.split("_", 2)[-1]}"'
     return response
 
 

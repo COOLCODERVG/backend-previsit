@@ -696,24 +696,47 @@ def build_lean_llm_generation_input(summary_payload, *, tone=None):
 
         {
           "appointment_notes": "...",
-          "symptoms": ["..."],
+          "symptoms": [{"name": "...", "severity": 5, "new": true}, ...],
           "questions": ["..."],
+          "notes": [{"content": "...", "category": "medication"}, ...],
           "preferences": {"tone": "...", "concerns": "...", "goals": "..."}
         }
 
-    This keeps the prompt small (faster generation) and removes any
-    incentive for the model to echo the input structure back in its output.
+    Symptoms are sorted by severity (descending) so the model's "primary
+    concern" framing lines up with what the PDF itself highlights first.
+    `notes` are capped and trimmed short (grounding for executive-summary
+    bullets like "Medication use was mentioned" without pulling in the full
+    patient note text) — this keeps the prompt small (faster generation) and
+    removes any incentive for the model to echo the input structure back.
     """
     context = build_llm_context(summary_payload)
     appointment = context.get('appointment') or {}
     prefs = context.get('patient_preferences') or {}
 
+    symptoms_sorted = sorted(
+        (context.get('symptoms') or []),
+        key=lambda s: -(int(s.get('severity') or 0)),
+    )
+
     return {
         'appointment_notes': appointment.get('purpose') or '',
-        'symptoms': [s.get('name') for s in (context.get('symptoms') or []) if s.get('name')],
+        'symptoms': [
+            {
+                'name': s.get('name'),
+                'severity': s.get('severity'),
+                'new': bool(s.get('is_new')),
+            }
+            for s in symptoms_sorted
+            if s.get('name')
+        ][:8],
         'questions': [
             q.get('question') for q in (context.get('questions_for_provider') or []) if q.get('question')
-        ],
+        ][:8],
+        'notes': [
+            {'content': (n.get('content') or '')[:140], 'category': n.get('category') or 'general'}
+            for n in (context.get('notes') or [])
+            if n.get('content')
+        ][:6],
         'preferences': {
             'tone': tone or prefs.get('communication_style') or 'concise',
             'concerns': prefs.get('concerns') or '',
@@ -803,16 +826,25 @@ def generate_llm_pdf_guidance(summary_payload, export_preferences=None, user_id=
     if not isinstance(guidance, dict):
         return None
 
+    # `suggest_questions` lets the user (via export_preferences / personalization
+    # settings) opt out of LLM-suggested discussion topics in the "Questions
+    # for Provider" section. Defaults on.
+    suggest_questions = True
+    if isinstance(export_preferences, dict) and 'suggest_questions' in export_preferences:
+        suggest_questions = bool(export_preferences.get('suggest_questions'))
+
     return {
         'tone': _sanitize_for_llm(guidance.get('tone'), 80),
-        'focus_header': _sanitize_for_llm(guidance.get('focus_header'), 120),
-        'focus_summary': _sanitize_for_llm(guidance.get('focus_summary'), 420),
-        'discussion_points': [
-            _sanitize_for_llm(v, 160) for v in (guidance.get('discussion_points') or [])[:5]
+        'primary_goal': _sanitize_for_llm(guidance.get('primary_goal'), 300),
+        'executive_summary': [
+            _sanitize_for_llm(v, 160) for v in (guidance.get('executive_summary') or [])[:5] if v
         ],
-        'clinician_questions': [
-            _sanitize_for_llm(v, 160) for v in (guidance.get('clinician_questions') or [])[:5]
+        'visit_prep_topics': [
+            _sanitize_for_llm(v, 160) for v in (guidance.get('visit_prep_topics') or [])[:5] if v
         ],
+        'suggested_questions': [
+            _sanitize_for_llm(v, 160) for v in (guidance.get('suggested_questions') or [])[:5] if v
+        ] if suggest_questions else [],
         'formatting_hints': {
             'include_bullets': bool((guidance.get('formatting_hints') or {}).get('include_bullets', True)),
             'emphasis_words': [

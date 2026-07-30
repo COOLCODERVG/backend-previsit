@@ -29,10 +29,10 @@ PDF_GUIDANCE_RESPONSE_FORMAT: Dict[str, Any] = {
     "type": "json",
     "schema": {
         "tone": "string",
-        "focus_header": "string",
-        "focus_summary": "string",
-        "discussion_points": "array",
-        "clinician_questions": "array",
+        "primary_goal": "string",
+        "executive_summary": "array",
+        "visit_prep_topics": "array",
+        "suggested_questions": "array",
         "formatting_hints": "object",
     },
 }
@@ -110,9 +110,26 @@ VISIT_SUMMARY_RESPONSE_FORMAT: Dict[str, Any] = {
 # Keyed by `task` (matches the `task` argument passed to `call_llama_inference`).
 REQUIRED_FIELDS_BY_TASK: Dict[str, List[str]] = {
     "visit_one_pager": ["headline", "focus_summary"],
-    "pdf_guidance": ["focus_summary"],
+    "pdf_guidance": ["primary_goal", "executive_summary"],
     "voice_transcript_extraction": [],
     "visit_summary": ["summary"],
+}
+
+# Short, task-specific instruction snippets appended to the generic prompt.
+# Kept to 1-3 sentences each so they add minimal latency/token cost while
+# still enforcing the "never invent facts" content rules for structured
+# healthcare documents (see PDF guidance content rules).
+TASK_INSTRUCTIONS: Dict[str, str] = {
+    "pdf_guidance": (
+        "Use ONLY facts present in Data; never diagnose, speculate, or invent symptoms, "
+        "medications, or timelines. executive_summary: 3-5 short bullet strings (no periods "
+        "needed) summarizing the visit for a 30-second read. primary_goal: one concise "
+        "sentence stating the patient's main goal for this visit. visit_prep_topics: short "
+        "bullets organizing what the patient already said they want to discuss (reorganize, "
+        "don't add new facts). suggested_questions: optional, only if symptoms/goals were "
+        "given — general discussion questions (e.g. 'What could be contributing to this?') "
+        "that never assume a diagnosis; return an empty array if nothing fits."
+    ),
 }
 
 
@@ -208,16 +225,18 @@ def _serialize_prompt_for_ollama(body: Dict[str, Any]) -> str:
         schema_json = json.dumps(response_format["schema"], ensure_ascii=False)
 
     steering_note = f" {len(steering_vectors)} personalization signal(s) supplied; reflect tone only." if steering_vectors else ""
+    task_instruction = TASK_INSTRUCTIONS.get(task)
+    task_instruction_line = f"\n{task_instruction}" if task_instruction else ""
 
     if schema_json:
         return (
-            f"Task: {task}.{steering_note}\n"
+            f"Task: {task}.{steering_note}{task_instruction_line}\n"
             "Return ONLY valid JSON matching this exact schema. No markdown, no code "
             "fences, no explanations, no extra keys, no text outside the JSON object.\n"
             f"Schema: {schema_json}\n"
             f"Data: {input_json}"
         )
-    return f"Task: {task}.{steering_note}\nData: {input_json}\nRespond with a concise, helpful answer."
+    return f"Task: {task}.{steering_note}{task_instruction_line}\nData: {input_json}\nRespond with a concise, helpful answer."
 
 
 def _parse_llm_json_output(text: Optional[str]) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -524,7 +543,7 @@ def call_llama_pdf_guidance(
         task="pdf_guidance",
         input_payload=deidentified_payload,
         steering_vectors=steering_vectors,
-        generation={"temperature": 0.1, "max_tokens": 400},
+        generation={"temperature": 0.1, "max_tokens": 450},
         response_format=PDF_GUIDANCE_RESPONSE_FORMAT,
         timeout_seconds=timeout_seconds,
     )

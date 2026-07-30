@@ -28,47 +28,32 @@ def _severity_word(level: int) -> str:
     return "unspecified"
 
 
-def _symptom_narrative(s: Dict[str, Any], esc) -> str:
-    """Turns a raw symptom row into a short prose sentence instead of a
-    'Name Severity/10' dump, e.g.:
-    "The patient reported a new headache with moderate severity (5/10).
-    Additional context should be discussed with the provider."
-    """
-    name = str(s.get("name") or "symptom").strip().lower()
-    try:
-        severity = int(s.get("severity") or 0)
-    except (TypeError, ValueError):
-        severity = 0
-    is_new = bool(s.get("is_new"))
-    is_worsening = bool(s.get("is_worsening"))
+def _symptom_meta_line(s: Dict[str, Any], esc) -> str:
+    """Short muted meta line for a symptom card: duration/timing only (no
+    prose sentence) e.g. "Lasting 3 days · worse at night"."""
     duration = str(s.get("duration") or "").strip()
     timing = str(s.get("timing") or "").strip()
-    notes = str(s.get("notes") or "").strip()
-
-    onset = "newly reported" if is_new else "an ongoing"
-    sentence = f"The patient reported {onset} {name}"
-    if severity:
-        sentence += f" with {_severity_word(severity)} severity ({severity}/10)"
+    bits = []
     if duration:
-        sentence += f", lasting {duration}"
+        bits.append(f"Lasting {esc(duration)}")
     if timing:
-        sentence += f" ({timing})"
-    if is_worsening:
-        sentence += ", and it has been getting worse"
-    sentence += "."
-    if notes:
-        sentence += f' Patient notes: "{esc(notes)}."'
-    else:
-        sentence += " Additional context should be discussed with the provider."
-    return sentence
+        bits.append(esc(timing))
+    return " \u00b7 ".join(bits)
 
 
 _NOTE_CATEGORY_LABELS = {
-    "medication": "Medication",
-    "emotional": "Emotional State",
+    "medication": "Current Medications",
+    "lifestyle": "Lifestyle",
+    "emotional": "Emotional Wellbeing",
+    "recent_changes": "Recent Changes",
     "goal": "Visit Goal",
-    "general": "General",
+    "general": "Other Notes",
 }
+
+# Categories shown in the "Things I Want My Provider to Know" section — the
+# visit goal is intentionally excluded here since it's already surfaced in
+# the Visit Overview section (avoid duplication across sections).
+_THINGS_TO_KNOW_ORDER = ("medication", "lifestyle", "emotional", "recent_changes", "general")
 
 
 def _classify_note(n: Dict[str, Any]) -> str:
@@ -78,10 +63,14 @@ def _classify_note(n: Dict[str, Any]) -> str:
     text = f"{n.get('title') or ''} {n.get('content') or ''}".lower()
     if any(k in text for k in ("medic", "pill", "dose", "tablet", "prescri", "take medicine")):
         return "medication"
-    if any(k in text for k in ("feel", "feeling", "anxious", "worried", "scared", "stressed", "mood", "emotion")):
+    if any(k in text for k in ("feel", "feeling", "anxious", "worried", "scared", "stressed", "mood", "emotion", "overwhelm")):
         return "emotional"
     if any(k in text for k in ("routine", "check-up", "checkup", "follow-up", "purpose", "goal", "reason")):
         return "goal"
+    if any(k in text for k in ("diet", "exercise", "sleep", "alcohol", "smoking", "smoke", "caffeine", "activity", "routine change")):
+        return "lifestyle"
+    if any(k in text for k in ("recently", "new since", "changed", "started", "stopped", "began", "since last visit", "last week", "last month")):
+        return "recent_changes"
     return "general"
 
 
@@ -128,36 +117,67 @@ def render_summary_html(summary_payload: Dict[str, Any], ai_guidance: Optional[D
     def empty_state(label: str) -> str:
         return f'<p class="empty">{esc(label)}</p>'
 
-    focus_header = (ai_guidance or {}).get("focus_header") or "Visit Focus"
-    focus_summary = (ai_guidance or {}).get("focus_summary") or (personalization.get("main_reason") or "")
-    discussion_points: List[str] = (ai_guidance or {}).get("discussion_points") or []
+    # ---- Visit Overview (replaces the old "General"/focus-only block) ------
+    # Appointment Reason + Primary Visit Goal, both sourced directly from
+    # patient-entered data (appointment notes / personalization profile) —
+    # never invented. The LLM's `primary_goal` (a rephrasing, not new facts)
+    # is preferred when available; otherwise we fall back to the raw
+    # patient-entered reason so the section is never empty without cause.
+    visit_reason = appointment.get("notes") or personalization.get("main_reason") or ""
+    primary_goal = (ai_guidance or {}).get("primary_goal") or personalization.get("main_reason") or visit_reason
 
     appointment_date = esc(appointment.get("appointment_date") or "")
     appointment_time = esc(appointment.get("appointment_time") or "")
     specialty = esc(appointment.get("specialty") or "")
     doctor_name = esc(appointment.get("doctor_name") or "Healthcare Provider")
 
-    # ---- Focus card -----------------------------------------------------
-    focus_body = esc(focus_summary) if focus_summary else '<span class="empty-inline">No focus area specified</span>'
-    discussion_html = ""
-    if discussion_points:
-        items = "".join(f"<li>{esc(p)}</li>" for p in discussion_points)
-        discussion_html = f'<ul class="discuss-list">{items}</ul>'
+    visit_reason_html = esc(visit_reason) if visit_reason else '<span class="empty-inline">Not specified</span>'
+    primary_goal_html = esc(primary_goal) if primary_goal else '<span class="empty-inline">Not specified</span>'
 
-    # ---- Symptoms ---------------------------------------------------------
-    # Renders each symptom as a short prose narrative (see _symptom_narrative)
-    # rather than a raw "Name Severity/10" dump.
-    if symptoms:
+    # ---- AI Executive Summary (NEW, first major content section) -----------
+    # 3-5 bullets, strictly from patient-provided information (LLM may only
+    # summarize/reorganize/rephrase — see content rules). Falls back to a
+    # short deterministic summary built from the same source facts if the
+    # LLM call failed, so the section is never silently empty.
+    executive_summary: List[str] = list((ai_guidance or {}).get("executive_summary") or [])
+    if not executive_summary:
+        symptoms_by_severity = sorted(symptoms, key=lambda s: -(int(s.get("severity") or 0)))
+        if symptoms_by_severity:
+            top = symptoms_by_severity[0]
+            sev = top.get("severity")
+            bit = f"Primary concern is {'a new ' if top.get('is_new') else ''}{esc(top.get('name', 'symptom')).lower()}"
+            if sev:
+                bit += f" rated {sev}/10"
+            executive_summary.append(bit + ".")
+        if personalization.get("biggest_concern"):
+            executive_summary.append(f"Patient's biggest concern: {esc(personalization.get('biggest_concern'))}.")
+        if any(_classify_note(n) == "medication" for n in notes):
+            executive_summary.append("Medication use was mentioned.")
+        if any(_classify_note(n) == "emotional" for n in notes):
+            executive_summary.append("Patient shared how they're feeling about this visit.")
+        if not executive_summary:
+            executive_summary.append("No additional visit details were provided.")
+    executive_summary_html = "".join(f"<li>{esc(v)}</li>" for v in executive_summary[:5])
+
+    # ---- Symptoms (structured cards, sorted by severity, no long prose) ----
+    symptoms_sorted = sorted(symptoms, key=lambda s: -(int(s.get("severity") or 0)))
+    if symptoms_sorted:
         rows = []
-        for s in symptoms:
+        for s in symptoms_sorted:
             tags = []
             if s.get("is_new"):
                 tags.append("NEW")
-            if s.get("is_worsening"):
+            elif s.get("is_worsening"):
                 tags.append("WORSENING")
-            tag_html = f'<span class="tag">{" · ".join(tags)}</span>' if tags else ""
+            else:
+                tags.append("ONGOING")
+            tag_html = f'<span class="tag">{" · ".join(tags)}</span>'
 
-            narrative_html = f'<p class="entry-note">{_symptom_narrative(s, esc)}</p>'
+            meta_line = _symptom_meta_line(s, esc)
+            meta_html = f'<div class="entry-meta">{meta_line}</div>' if meta_line else ""
+
+            note_text = str(s.get("notes") or "").strip()
+            note_html = f'<p class="entry-note">{esc(note_text)}</p>' if note_text else ""
 
             rows.append(
                 f"""
@@ -167,17 +187,18 @@ def render_summary_html(summary_payload: Dict[str, Any], ai_guidance: Optional[D
                     {tag_html}
                   </div>
                   <div class="entry-severity">{severity_meter(s.get('severity', 0))}</div>
-                  {narrative_html}
+                  {meta_html}
+                  {note_html}
                 </div>
                 """
             )
         symptoms_html = "".join(rows)
     else:
-        symptoms_html = empty_state("No symptoms recorded")
+        symptoms_html = empty_state("No symptoms were added.")
 
-    # ---- Questions ----------------------------------------------------------
+    # ---- Questions for Provider ---------------------------------------------
     # Vague placeholder answers ("Nope", "N/A") are filtered out; if nothing
-    # substantive remains we show an actionable suggestion instead of an
+    # substantive remains we show a clear empty-state instead of an
     # empty/useless section.
     all_pending = [q.get("text", "") for q in questions if not q.get("is_answered")]
     pending_questions = [q for q in all_pending if not _is_vague(q)]
@@ -188,79 +209,90 @@ def render_summary_html(summary_payload: Dict[str, Any], ai_guidance: Optional[D
         )
         questions_html = f'<ol class="question-list">{items}</ol>'
     else:
-        questions_html = (
-            '<p class="empty">No specific questions were added. Consider asking about symptoms, '
-            'possible causes, treatment options, and next steps.</p>'
-        )
+        questions_html = empty_state("No questions added.")
 
-    # ---- Notes ----------------------------------------------------------------
-    # Notes are grouped into meaningful categories (medication / emotional /
-    # visit goal / general) instead of listed as a raw title+content dump.
+    # Suggested discussion topics: LLM-suggested (never assumes a diagnosis),
+    # clearly labelled and visually distinct from the patient's own questions.
+    suggested_questions: List[str] = list((ai_guidance or {}).get("suggested_questions") or [])
+    suggested_questions_html = ""
+    if suggested_questions:
+        items = "".join(f"<li>{esc(v)}</li>" for v in suggested_questions[:5])
+        suggested_questions_html = f"""
+        <div class="suggested-topics">
+          <div class="suggested-topics-label">Suggested discussion topics</div>
+          <ul>{items}</ul>
+        </div>
+        """
+
+    # ---- Things I Want My Provider to Know (replaces "Patient Notes") ------
+    # Grouped bullets by category; only categories with actual content are
+    # shown (never invented), and wording avoids repeating what's already
+    # covered verbatim in Symptoms / Visit Overview above.
     if notes:
         grouped: Dict[str, List[str]] = {}
         for n in notes:
             category = _classify_note(n)
+            if category == "goal":
+                continue  # already covered by Visit Overview — avoid duplication
             grouped.setdefault(category, []).append(_note_display_text(n, category, esc))
 
         rows = []
-        for category in ("medication", "emotional", "goal", "general"):
+        for category in _THINGS_TO_KNOW_ORDER:
             entries = grouped.get(category)
             if not entries:
                 continue
             label = _NOTE_CATEGORY_LABELS[category]
-            items_html = "".join(f'<p class="entry-note">{text}</p>' for text in entries)
+            items_html = "".join(f"<li>{text}</li>" for text in entries)
             rows.append(
                 f"""
-                <div class="entry">
-                  <span class="entry-title">{esc(label)}</span>
-                  {items_html}
+                <div class="know-group">
+                  <div class="know-group-label">{esc(label)}</div>
+                  <ul>{items_html}</ul>
                 </div>
                 """
             )
-        notes_html = "".join(rows)
+        things_to_know_html = "".join(rows) or empty_state("No patient notes provided.")
     else:
-        notes_html = empty_state("No notes available")
+        things_to_know_html = empty_state("No patient notes provided.")
 
-    # ---- AI Visit Preparation Summary ---------------------------------------
-    # Organizational-only guidance: what the patient wants to discuss, useful
-    # info to mention, and suggested topics. Never a diagnosis or medical advice.
-    ai_discuss = (ai_guidance or {}).get("focus_summary") or (
-        f"Discuss {symptoms[0].get('name')} and any other symptoms listed above." if symptoms
-        else "Discuss the reason for this visit and any concerns you have."
-    )
-    ai_mention_items = []
-    if personalization.get("biggest_concern"):
-        ai_mention_items.append(personalization.get("biggest_concern"))
-    for n in notes[:3]:
-        if _classify_note(n) == "medication":
-            ai_mention_items.append(n.get("content") or "")
-    ai_topics = list((ai_guidance or {}).get("discussion_points") or [])
-    if not ai_topics:
-        ai_topics = pending_questions[:5] or [
-            f"Ask about {s.get('name')}" for s in symptoms[:3]
+    # ---- Visit Preparation (renamed from "AI Visit Preparation Summary") ---
+    # Organizes the patient's OWN information only — never new medical facts.
+    visit_prep_topics: List[str] = list((ai_guidance or {}).get("visit_prep_topics") or [])
+    if not visit_prep_topics:
+        visit_prep_topics = pending_questions[:5] or [
+            f"Discuss {s.get('name')}" for s in symptoms_sorted[:3]
         ]
+    prep_mention_items = []
+    if personalization.get("biggest_concern"):
+        prep_mention_items.append(personalization.get("biggest_concern"))
+    for n in notes:
+        if _classify_note(n) == "medication":
+            prep_mention_items.append(n.get("content") or "")
+    prep_reminders = [str(v) for v in (personalization.get("prepared_items") or [])]
 
-    ai_mention_html = (
-        "".join(f"<li>{esc(v)}</li>" for v in ai_mention_items if v)
-        or '<li class="empty-inline">No additional context provided</li>'
-    )
-    ai_topics_html = (
-        "".join(f"<li>{esc(v)}</li>" for v in ai_topics if v)
+    prep_topics_html = (
+        "".join(f"<li>{esc(v)}</li>" for v in visit_prep_topics if v)
         or '<li class="empty-inline">No specific topics suggested</li>'
     )
+    prep_mention_html = (
+        "".join(f"<li>{esc(v)}</li>" for v in prep_mention_items if v)
+        or '<li class="empty-inline">No additional context provided</li>'
+    )
+    prep_reminders_html = (
+        "".join(f"<li>{esc(v)}</li>" for v in prep_reminders if v)
+        or '<li class="empty-inline">No reminders added</li>'
+    )
 
-    # ---- Provider Summary (separate, doctor-facing section) ------------------
-    # Only patient-provided facts — no inference or hallucinated clinical
-    # content — clearly labelled per PART 3 of the export spec.
+    # ---- Provider Snapshot (renamed from "Provider Summary") ---------------
+    # A concise, one-minute handoff — only patient-provided facts, no
+    # inference, assessment, or recommendations.
     provider_symptom_rows = []
-    for s in symptoms:
+    for s in symptoms_sorted:
         bits = [esc(s.get("name", "symptom"))]
         if s.get("severity"):
             bits.append(f"severity {s.get('severity')}/10")
         if s.get("duration"):
             bits.append(f"duration {esc(s.get('duration'))}")
-        if s.get("timing"):
-            bits.append(f"timing {esc(s.get('timing'))}")
         provider_symptom_rows.append(f"<li>{', '.join(bits)}</li>")
     provider_symptoms_html = "".join(provider_symptom_rows) or '<li class="empty-inline">None reported</li>'
 
@@ -269,20 +301,28 @@ def render_summary_html(summary_payload: Dict[str, Any], ai_guidance: Optional[D
         'next_steps_plan': 'Wants next steps or a treatment plan',
         'tests_or_referrals': 'Wants tests or referrals',
         'heard_understood': 'Wants to feel heard and understood',
-    }.get(personalization.get("appointment_outcome") or "", "") or personalization.get("main_reason") or "Not specified"
+    }.get(personalization.get("appointment_outcome") or "", "") or primary_goal or "Not specified"
 
     provider_questions_html = (
         "".join(f"<li>{esc(q)}</li>" for q in all_pending)
         or '<li class="empty-inline">No questions provided</li>'
     )
 
-    provider_notes_rows = []
-    for n in notes:
-        category = _classify_note(n)
-        if category == "medication":
-            provider_notes_rows.append(f"<li>Medication mentioned: {esc(n.get('content'))}</li>")
-        elif n.get("content"):
-            provider_notes_rows.append(f"<li>{esc(n.get('content'))}</li>")
+    provider_med_rows = [
+        f"<li>{esc(n.get('content'))}</li>" for n in notes if _classify_note(n) == "medication" and n.get("content")
+    ]
+    provider_meds_html = "".join(provider_med_rows) or '<li class="empty-inline">None mentioned</li>'
+
+    provider_emotional_rows = [
+        f"<li>{esc(n.get('content'))}</li>" for n in notes if _classify_note(n) == "emotional" and n.get("content")
+    ]
+    provider_emotional_html = "".join(provider_emotional_rows) or '<li class="empty-inline">None mentioned</li>'
+
+    provider_notes_rows = [
+        f"<li>{esc(n.get('content'))}</li>"
+        for n in notes
+        if _classify_note(n) not in ("medication", "emotional", "goal") and n.get("content")
+    ]
     provider_notes_html = "".join(provider_notes_rows) or '<li class="empty-inline">None provided</li>'
 
     generated_at = esc(datetime.utcnow().strftime("%B %d, %Y \u00b7 %H:%M UTC"))
@@ -379,14 +419,15 @@ def render_summary_html(summary_payload: Dict[str, Any], ai_guidance: Optional[D
         color: var(--ink);
       }}
 
-      /* ---------- Focus block (signature accent) ---------- */
-      .focus {{
+      /* ---------- Visit Overview (Appointment Reason + Primary Goal) ---------- */
+      .overview {{
         display: flex;
-        gap: 14px;
+        gap: 28px;
         padding: 16px 0 18px 16px;
         border-left: 3px solid var(--ink);
-        margin-bottom: 30px;
+        margin-bottom: 24px;
       }}
+      .overview-col {{ flex: 1; }}
       .focus-label {{
         font-size: 8px;
         font-weight: 700;
@@ -401,14 +442,28 @@ def render_summary_html(summary_payload: Dict[str, Any], ai_guidance: Optional[D
         line-height: 1.7;
       }}
       .empty-inline {{ color: var(--graphite); font-style: italic; }}
-      .discuss-list {{
-        margin-top: 10px;
-        padding-left: 15px;
-      }}
-      .discuss-list li {{
-        font-size: 10px;
-        color: var(--charcoal);
+
+      /* ---------- AI Executive Summary ---------- */
+      .exec-summary {{
+        background: var(--mist);
+        border-radius: 6px;
+        padding: 16px 18px;
         margin-bottom: 4px;
+      }}
+      .exec-summary ul {{ list-style: none; }}
+      .exec-summary li {{
+        font-size: 11px;
+        color: var(--ink);
+        line-height: 1.65;
+        padding: 5px 0 5px 16px;
+        position: relative;
+      }}
+      .exec-summary li::before {{
+        content: "\2022";
+        position: absolute;
+        left: 0;
+        color: var(--ink);
+        font-weight: 700;
       }}
 
       /* ---------- Section scaffolding ---------- */
@@ -441,7 +496,7 @@ def render_summary_html(summary_payload: Dict[str, Any], ai_guidance: Optional[D
         padding: 4px 0 2px;
       }}
 
-      /* ---------- Repeating entries (symptoms / notes) ---------- */
+      /* ---------- Repeating entries (symptoms) ---------- */
       .entry {{
         padding: 12px 0;
         border-bottom: 1px solid var(--hairline);
@@ -512,6 +567,37 @@ def render_summary_html(summary_payload: Dict[str, Any], ai_guidance: Optional[D
         color: var(--ink);
         line-height: 1.6;
       }}
+      .suggested-topics {{
+        margin-top: 14px;
+        padding: 12px 14px;
+        background: var(--mist);
+        border-radius: 6px;
+      }}
+      .suggested-topics-label {{
+        font-size: 8px;
+        font-weight: 700;
+        letter-spacing: 0.8px;
+        text-transform: uppercase;
+        color: var(--graphite);
+        margin-bottom: 6px;
+      }}
+      .suggested-topics ul {{ padding-left: 15px; }}
+      .suggested-topics li {{ font-size: 10px; color: var(--charcoal); margin-bottom: 3px; }}
+
+      /* ---------- Things I Want My Provider to Know ---------- */
+      .know-group {{
+        padding: 10px 0;
+        border-bottom: 1px solid var(--hairline);
+      }}
+      .know-group:last-child {{ border-bottom: none; }}
+      .know-group-label {{
+        font-size: 9.5px;
+        font-weight: 700;
+        color: var(--ink);
+        margin-bottom: 5px;
+      }}
+      .know-group ul {{ padding-left: 15px; }}
+      .know-group li {{ font-size: 10px; color: var(--charcoal); margin-bottom: 3px; line-height: 1.6; }}
 
       /* ---------- AI Visit Preparation Summary ---------- */
       .ai-prep {{
@@ -630,13 +716,25 @@ def render_summary_html(summary_payload: Dict[str, Any], ai_guidance: Optional[D
       </div>
     </div>
 
-    <div class="focus">
-      <div>
-        <div class="focus-label">{esc(focus_header)}</div>
-        <div class="focus-body">{focus_body}</div>
-        {discussion_html}
+    <div class="overview">
+      <div class="overview-col">
+        <div class="focus-label">Appointment Reason</div>
+        <div class="focus-body">{visit_reason_html}</div>
+      </div>
+      <div class="overview-col">
+        <div class="focus-label">Goal</div>
+        <div class="focus-body">{primary_goal_html}</div>
       </div>
     </div>
+
+    <section>
+      <div class="section-head">
+        <span class="section-title">AI Executive Summary</span>
+      </div>
+      <div class="exec-summary">
+        <ul>{executive_summary_html}</ul>
+      </div>
+    </section>
 
     <section>
       <div class="section-head">
@@ -652,27 +750,27 @@ def render_summary_html(summary_payload: Dict[str, Any], ai_guidance: Optional[D
         <span class="section-count">{len(pending_questions)} pending</span>
       </div>
       {questions_html}
+      {suggested_questions_html}
     </section>
 
     <section>
       <div class="section-head">
-        <span class="section-title">Patient Notes</span>
-        <span class="section-count">{len(notes)} note{'s' if len(notes) != 1 else ''}</span>
+        <span class="section-title">Things I Want My Provider to Know</span>
       </div>
-      {notes_html}
+      {things_to_know_html}
     </section>
 
     <section>
       <div class="section-head">
-        <span class="section-title">AI Visit Preparation Summary</span>
+        <span class="section-title">Visit Preparation</span>
       </div>
       <div class="ai-prep">
-        <div class="ai-prep-subhead">What you want to discuss</div>
-        <p class="entry-note">{esc(ai_discuss)}</p>
-        <div class="ai-prep-subhead">Information that may be useful to mention</div>
-        <ul>{ai_mention_html}</ul>
-        <div class="ai-prep-subhead">Suggested topics to bring up</div>
-        <ul>{ai_topics_html}</ul>
+        <div class="ai-prep-subhead">Important topics to mention</div>
+        <ul>{prep_mention_html}</ul>
+        <div class="ai-prep-subhead">Suggested discussion order</div>
+        <ul>{prep_topics_html}</ul>
+        <div class="ai-prep-subhead">Helpful reminders</div>
+        <ul>{prep_reminders_html}</ul>
         <div class="ai-prep-note">
           This section only helps organize your conversation with your provider. It is not medical advice and does not diagnose any condition.
         </div>
@@ -681,16 +779,20 @@ def render_summary_html(summary_payload: Dict[str, Any], ai_guidance: Optional[D
 
     <section>
       <div class="section-head">
-        <span class="section-title">Provider Summary</span>
+        <span class="section-title">Provider Snapshot</span>
       </div>
       <div class="provider-summary">
         <div class="provider-summary-label">Based only on patient-provided information</div>
-        <div class="provider-subhead">Patient-reported concerns</div>
+        <div class="provider-subhead">Chief concerns</div>
         <ul>{provider_symptoms_html}</ul>
         <div class="provider-subhead">Patient goals</div>
         <p class="entry-note">{esc(goal_text)}</p>
-        <div class="provider-subhead">Patient questions</div>
+        <div class="provider-subhead">Questions</div>
         <ul>{provider_questions_html}</ul>
+        <div class="provider-subhead">Medication mentions</div>
+        <ul>{provider_meds_html}</ul>
+        <div class="provider-subhead">Emotional concerns</div>
+        <ul>{provider_emotional_html}</ul>
         <div class="provider-subhead">Relevant notes</div>
         <ul>{provider_notes_html}</ul>
       </div>
